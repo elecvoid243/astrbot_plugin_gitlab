@@ -1,0 +1,8 @@
+name: astrbot_plugin_gitlab
+display_name: GitLab 项目机器人
+desc: GitLab 消息平台适配器，结合仓库源码、议题、合并请求与提交记录自动分析项目讨论。
+version: v0.1.1
+author: astrbot_plugin_gitlab
+support_platforms:
+  - gitlab
+
