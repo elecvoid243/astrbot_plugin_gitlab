@@ -16,7 +16,6 @@ from astrbot.api.message_components import Plain
 from astrbot.api.platform import Platform, PlatformMetadata, register_platform_adapter
 from astrbot.api.star import Context, StarTools
 from astrbot.core.agent_team_execution import model_delivery
-from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
 
 from .events import project_job
 from .expert import HELP, ProjectExpert
@@ -172,15 +171,17 @@ class GitLabPlatform(Platform):
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
 
-    async def generate(self, system, prompt, *, output_limit=None, **kwargs):
+    async def request_completion(self, system, prompt, *, output_limit=None, **kwargs):
         with model_delivery(None, output_limit=output_limit):
-            reply = await self.context.llm_generate(
+            return await self.context.llm_generate(
                 chat_provider_id=self.config["gitlab_provider"],
                 system_prompt=system,
                 prompt=prompt,
                 **kwargs,
             )
-        return reply.completion_text
+
+    async def generate(self, system, prompt):
+        return (await self.request_completion(system, prompt)).completion_text
 
     async def webhook_callback(self, request):
         """Authenticate the hook and store accepted work before acknowledging it.
@@ -270,20 +271,17 @@ class GitLabPlatform(Platform):
 
         result = {"findings": []}
         if prepared.prompt:
-            llm_params = (
-                {"max_tokens": budget.output}
-                if isinstance(provider, ProviderAnthropic)
-                else None
-            )
             for system in (REVIEW_REPORT, REVIEW_RETRY):
-                completion = await self.generate(
+                reply = await self.request_completion(
                     system,
                     prepared.prompt,
                     output_limit=budget.output,
-                    llm_params=llm_params,
+                    llm_params=budget.llm_params,
                 )
+                if getattr(reply, "usage_matches_request", True) is False:
+                    return "评审失败。模型提供商重试时缩减了原始输入，本次没有确认任何文件的评审覆盖。"
                 try:
-                    result = decode_review(completion)
+                    result = decode_review(reply.completion_text)
                     break
                 except (TypeError, ValueError):
                     if system == REVIEW_RETRY:

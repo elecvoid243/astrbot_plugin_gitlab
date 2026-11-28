@@ -219,6 +219,7 @@ class SourceIndex:
             result.append(
                 dict(
                     kind="code",
+                    path=file,
                     label=f"{file} L{start}–{end}",
                     url=f"{self.web_url}/-/blob/{self.sha}/{quote(file)}#L{start}-{end}",
                     text="\n".join(f"{n}: {s}" for n, s in enumerate(lines, start))[

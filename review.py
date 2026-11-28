@@ -4,12 +4,14 @@ import json
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from itertools import chain
 from typing import Self
 
 from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 from astrbot.core.agent.message import Message
 from astrbot.core.agent_team_execution import resolve_model_output_limit
 from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
+from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.utils.llm_metadata import LLM_METADATAS
 
 from .expert import decode, render_findings
@@ -29,6 +31,7 @@ ASSIGNMENT = re.compile(
     r"^[+-]\s*(?:(?:const|let|var)\s+)?([A-Za-z_]\w{2,})\s*(?::[^\n=]+)?=(?!=)",
     re.M,
 )
+DECLARATION = re.compile(r"^\d+:[ \t]*(?:async[ \t]+)?(?:def|function|fn|func)[ \t]+")
 TOKEN_COUNTER = EstimateTokenCounter()
 
 
@@ -63,6 +66,7 @@ class ReviewVersion:
 class ReviewBudget:
     window: int
     output: int
+    output_field: str | None = None
 
     @classmethod
     def for_provider(cls, provider) -> Self:
@@ -74,6 +78,7 @@ class ReviewBudget:
                 LLM_METADATAS.get(model, {}).get("limit", {}).get("context") or 8192
             )
         output = max(1, min(2048, window // 4))
+        output_field = None
         if isinstance(provider, ProviderAnthropic):
             # AstrBot's Anthropic adapter gives static output limits precedence
             # over its per-request llm_params.
@@ -81,7 +86,16 @@ class ReviewBudget:
                 resolve_model_output_limit(None, config.get("custom_extra_body"))
                 or output
             )
-        return cls(window, output)
+            output_field = "max_tokens"
+        elif isinstance(provider, ProviderOpenAIOfficial) and re.search(
+            r"(?:^|/)o[1-9]\d*(?:$|[-:])", provider.get_model(), re.I
+        ):
+            output_field = "max_completion_tokens"
+        return cls(window, output, output_field)
+
+    @property
+    def llm_params(self) -> dict[str, int] | None:
+        return {self.output_field: self.output} if self.output_field else None
 
     @property
     def input_limit(self) -> int:
@@ -134,11 +148,11 @@ def render_prompt(task: dict, evidence: dict) -> str:
 
 
 def choose_patches(
-    changes: Iterator[FilePatch], task: dict, limit: int
-) -> tuple[list[tuple[str, str]], list[str]]:
+    changes: Iterator[FilePatch], task: dict, evidence: dict, limit: int
+) -> tuple[list[FilePatch], list[str]]:
     selected = []
     omitted = []
-    tokens = estimate_tokens(render_prompt(task, {}))
+    tokens = estimate_tokens(render_prompt(task, evidence))
     rounding = 1
     for patch in changes:
         if patch.text is None:
@@ -152,32 +166,73 @@ def choose_patches(
         # The host estimator rounds down per string. Recount the full JSON
         # around the limit to recover room lost to per-patch rounding.
         if candidate + rounding + 1 > limit:
-            diff = "".join(text for _, text in selected) + patch.text
-            candidate = estimate_tokens(render_prompt({**task, "diff": diff}, {}))
+            diff = patch_text(selected) + patch.text
+            candidate = estimate_tokens(render_prompt({**task, "diff": diff}, evidence))
             if candidate > limit:
                 omitted.append(patch.path)
                 continue
             rounding = 1
         else:
             rounding += 1
-        selected.append((patch.path, patch.text))
+        selected.append(patch)
         tokens = candidate
     return selected, omitted
 
 
+def patch_text(patches: list[FilePatch]) -> str:
+    return "".join(patch.text or "" for patch in patches)
+
+
+def patch_symbols(patch: FilePatch) -> list[str]:
+    text = patch.text or ""
+    return list(dict.fromkeys([*SYMBOL.findall(text), *ASSIGNMENT.findall(text)]))[:3]
+
+
+def related_references(
+    source: SourceIndex, patch: FilePatch
+) -> Iterator[tuple[dict, bool]]:
+    for symbol in patch_symbols(patch):
+        name = re.compile(rf"\b{re.escape(symbol)}\b")
+        call = re.compile(rf"\b{re.escape(symbol)}\s*\(")
+        for row in source.lookup(symbol):
+            if row["path"] == patch.path:
+                continue
+            matches = [
+                (line, match)
+                for line in row["text"].splitlines()
+                if (match := name.search(line))
+            ]
+            if not matches:
+                continue
+            invocation = next(
+                (
+                    (line, match)
+                    for line, match in matches
+                    if call.search(line) and not DECLARATION.match(line)
+                ),
+                None,
+            )
+            line, match = invocation or matches[0]
+            start = max(0, match.start() - 45)
+            yield {**row, "text": line[start : start + 160]}, invocation is not None
+
+
 def evidence_candidates(
-    source: SourceIndex, selected: list[tuple[str, str]]
+    source: SourceIndex, selected: list[FilePatch]
 ) -> Iterator[dict]:
-    symbols = {}
-    for _, text in selected:
-        names = dict.fromkeys([*SYMBOL.findall(text), *ASSIGNMENT.findall(text)])
-        symbols.update(dict.fromkeys(list(names)[:3]))
+    symbols = dict.fromkeys(
+        symbol for patch in selected for symbol in patch_symbols(patch)
+    )
     for symbol in symbols:
         yield from source.lookup(symbol)
-    for path, text in selected:
-        hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)", text, re.M)
+    for patch in selected:
+        hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)", patch.text or "", re.M)
         line = max(1, int(hunk[1])) if hunk else 1
-        yield from source.lookup("", path, line)
+        yield from source.lookup("", patch.path, line)
+
+
+def prompt_evidence(row: dict) -> dict:
+    return dict(kind=row["kind"], label=row["label"], text=row["text"][:850])
 
 
 def prepare_review(
@@ -206,15 +261,58 @@ def prepare_review(
 
     # Even at four UTF-8 bytes per character the estimator charges at least
     # 0.3 tokens per character, so longer raw patches cannot fit this window.
-    changes = source.review_patches(version.base, version.head, budget.window * 16)
-    selected, omitted = choose_patches(changes, task, limit)
+    def changes():
+        return source.review_patches(version.base, version.head, budget.window * 16)
+
+    references: dict[str, tuple[FilePatch, dict]] = {}
+
+    def discover_references():
+        for patch in changes():
+            if "call" not in references:
+                for row, is_call in related_references(source, patch):
+                    kind = "call" if is_call else "reference"
+                    if kind in references:
+                        continue
+                    # Keep the initial plan when a patch cannot coexist even
+                    # with a single compact reference.
+                    minimal = render_prompt(
+                        {**task, "diff": patch.text}, {"E1": prompt_evidence(row)}
+                    )
+                    if estimate_tokens(minimal) > limit:
+                        continue
+                    references[kind] = (patch, row)
+                    if is_call:
+                        break
+            yield patch
+
+    selected, omitted = choose_patches(discover_references(), task, {}, limit)
+    evidence = {}
+    source_rows = {}
+    related = references.get("call") or references.get("reference")
+    if related:
+        anchor, row = related
+        evidence["E1"] = prompt_evidence(row)
+        if (
+            anchor not in selected
+            or estimate_tokens(
+                render_prompt({**task, "diff": patch_text(selected)}, evidence)
+            )
+            > limit
+        ):
+            # Protect the patch and its compact evidence from unrelated files.
+            remaining_changes = (
+                patch for patch in changes() if patch.path != anchor.path
+            )
+            selected, omitted = choose_patches(
+                chain((anchor,), remaining_changes), task, evidence, limit
+            )
+        source_rows["E1"] = row
+
     if not selected:
         return PreparedReview(None, {}, omitted)
 
-    task["diff"] = "".join(text for _, text in selected)
-    evidence = {}
-    source_rows = {}
-    urls = set()
+    task["diff"] = patch_text(selected)
+    urls = {row["url"] for row in source_rows.values()}
     # Evidence only adds JSON between the empty map's braces. Count that
     # rendered fragment against the remaining capacity, allowing for rounding.
     remaining = limit - estimate_tokens(render_prompt(task, {})) - 1
@@ -224,9 +322,7 @@ def prepare_review(
         if row["url"] in urls:
             continue
         key = f"E{len(evidence) + 1}"
-        evidence[key] = dict(
-            kind=row["kind"], label=row["label"], text=row["text"][:850]
-        )
+        evidence[key] = prompt_evidence(row)
         rendered = json.dumps(evidence, ensure_ascii=False)[1:-1]
         if estimate_tokens(rendered) <= remaining:
             urls.add(row["url"])

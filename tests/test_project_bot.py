@@ -9,17 +9,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import httpx
 from aiohttp import web
+from anthropic import AsyncAnthropic
 from astrbot.core.agent.context.token_counter import EstimateTokenCounter
 from astrbot.core.agent.message import Message
 from astrbot.core.agent_team_execution import current_model_output_limit
 from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
+from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.dashboard.api.platform import router
 from astrbot.dashboard.services.platform_service import PlatformService
 from fastapi import FastAPI
+from openai import AsyncOpenAI
 
 from ..adapter import DEFAULTS, GitLabPlatform, StarTools
 from ..events import project_job
@@ -335,10 +338,6 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                 output_limit = current_model_output_limit.get()
                 assert output_limit is not None
                 self.assertGreater(output_limit, 0)
-                if isinstance(self.provider, ProviderAnthropic):
-                    self.assertEqual(
-                        kwargs.get("llm_params"), {"max_tokens": output_limit}
-                    )
                 tokens = EstimateTokenCounter().count_tokens(
                     [
                         Message(role="system", content=kwargs["system_prompt"]),
@@ -371,6 +370,72 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         )
         event["merge_request"] = {"iid": 2}
         return event
+
+    def use_native_provider(self, provider):
+        self.provider = provider
+
+        async def generate_native(*, chat_provider_id, **kwargs):
+            self.assertEqual(chat_provider_id, "test-model")
+            return await provider.text_chat(**kwargs)
+
+        self.adapter.context.llm_generate = generate_native
+
+    async def use_native_chat(self, model, *, reject_context=False):
+        provider = ProviderOpenAIOfficial(
+            {
+                "id": "test-model",
+                "model": model,
+                "key": ["offline"],
+                "api_base": "https://example.invalid/v1",
+                "max_context_tokens": 24000,
+            },
+            {},
+        )
+        await provider.client.close()
+        requests = []
+
+        def record(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            if reject_context and any(m["role"] == "user" for m in payload["messages"]):
+                return httpx.Response(
+                    400, json={"error": {"message": "maximum context length"}}
+                )
+            findings = [{"text": "模型返回的发现", "refs": ["E1"]}]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chat_1",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps({"findings": findings}),
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 50,
+                        "completion_tokens": 21,
+                        "total_tokens": 71,
+                    },
+                },
+            )
+
+        provider.client = AsyncOpenAI(
+            api_key="offline",
+            base_url="https://example.invalid/v1",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(record)),
+        )
+        self.addAsyncCleanup(provider.terminate)
+        self.use_native_provider(provider)
+        return requests
 
     def event(self, kind, **attrs) -> dict[str, Any]:
         return dict(
@@ -750,6 +815,138 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertIn(f"/-/blob/{self.head}/caller.py", body)
         self.assertNotIn("预算遗漏", body)
 
+    async def test_review_reserves_room_for_the_unchanged_call_site(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        self.git("switch", "--detach", self.base)
+        (self.work / "caller.py").write_text(
+            "from service import find_order\n"
+            + "# Existing call-site documentation for order processing\n" * 22
+            + "print(find_order(42).upper())\n"
+        )
+        self.git("commit", "-am", "Document the existing caller")
+        self.base = self.git("rev-parse", "HEAD")
+        (self.work / "service.py").write_text("def find_order(key):\n    return None\n")
+        for filename, repeated in (("a_padding.txt", "a"), ("z_padding.txt", "z")):
+            (self.work / filename).write_text(
+                "".join(f"row {i:02d}: {repeated * 40}\n" for i in range(25))
+            )
+        self.git("add", ".")
+        self.git("commit", "-m", "Change order fallback with additional data")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        call_sites = [
+            row["text"]
+            for row in self.reports[0]["evidence"].values()
+            if "caller.py" in row["label"]
+        ]
+        self.assertTrue(
+            any("print(find_order(42).upper())" in text for text in call_sites)
+        )
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("+    return None", diff)
+        self.assertIn("+row 24: " + "a" * 40, diff)
+        self.assertNotIn("z_padding.txt", diff)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn(f"/-/blob/{self.head}/caller.py", body)
+        self.assertIn("预算遗漏的文件**\n\n- `z_padding.txt`", body)
+
+    async def test_review_sends_the_o_series_limit_in_the_native_chat_payload(self):
+        requests = await self.use_native_chat("o3-2025-04-16")
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["max_completion_tokens"], 2048)
+        self.assertNotIn("max_tokens", requests[0])
+
+    async def test_review_prioritizes_a_patch_with_evidence_after_an_early_large_file(
+        self,
+    ):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        (self.work / "a_padding.txt").write_text("a" * 2800 + "\n")
+        self.git("add", "a_padding.txt")
+        self.git("commit", "-m", "Add a large data file")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertIn("+    return None", self.reports[0]["task"]["diff"])
+        self.assertNotIn("a_padding.txt", self.reports[0]["task"]["diff"])
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn(f"/-/blob/{self.head}/caller.py", body)
+        self.assertIn("预算遗漏的文件**\n\n- `a_padding.txt`", body)
+
+    async def test_review_keeps_an_intact_patch_when_its_evidence_cannot_fit(self):
+        self.provider.provider_config["max_context_tokens"] = 380
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertIn("+    return None", self.reports[0]["task"]["diff"])
+        self.assertNotIn("预算遗漏", self.notes["/merge_requests/2"][0]["body"])
+
+    async def test_review_keeps_the_vllm_limit_in_the_native_chat_payload(self):
+        requests = await self.use_native_chat("Qwen/Qwen3-8B")
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["max_tokens"], 2048)
+        self.assertNotIn("max_completion_tokens", requests[0])
+
+    async def test_review_reports_failure_after_native_chat_discards_the_diff(self):
+        requests = await self.use_native_chat("Qwen/Qwen3-8B", reject_context=True)
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(requests), 2)
+        self.assertIn(
+            "+    return None",
+            json.loads(requests[0]["messages"][-1]["content"])["task"]["diff"],
+        )
+        self.assertEqual([m["role"] for m in requests[1]["messages"]], ["system"])
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("评审失败", body)
+        self.assertNotIn("模型返回的发现", body)
+
+    async def test_issue_analysis_keeps_the_provider_recovery_behavior(self):
+        requests = await self.use_native_chat("Qwen/Qwen3-8B", reject_context=True)
+        await self.deliver(self.event("issue", action="open", iid=1))
+        await self.wait_done()
+
+        self.assertEqual(len(requests), 4)
+        self.assertIn("模型返回的发现", self.notes["/issues/1"][0]["body"])
+
     async def test_review_keeps_both_halves_of_a_git_file_type_change(self):
         target = self.work / "target.txt"
         target.write_text("caller.py")
@@ -772,13 +969,47 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertIn("+caller.py", diff)
 
     async def test_review_reserves_the_effective_anthropic_output_limit(self):
-        self.provider = Mock(
-            spec=ProviderAnthropic,
-            provider_config={
+        provider = ProviderAnthropic(
+            {
+                "id": "test-model",
+                "model": "claude-test",
                 "max_context_tokens": 5000,
                 "custom_extra_body": {"max_output_tokens": 1800},
             },
+            {},
+            use_api_key=False,
         )
+        requests = []
+
+        def record(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-test",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {"findings": [{"text": "检查调用方", "refs": ["E1"]}]}
+                            ),
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 200, "output_tokens": 20},
+                },
+            )
+
+        provider.client = AsyncAnthropic(
+            api_key="offline",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(record)),
+        )
+        self.addAsyncCleanup(provider.terminate)
+        self.use_native_provider(provider)
         event = self.event(
             "merge_request", action="open", iid=2, last_commit={"id": self.head}
         )
@@ -786,8 +1017,9 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         await self.deliver(event)
         await self.wait_done()
 
-        self.assertEqual(len(self.model_requests), 1)
-        self.assertEqual(self.model_requests[0]["llm_params"], {"max_tokens": 1800})
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["max_tokens"], 1800)
+        self.assertNotIn("max_output_tokens", requests[0])
         self.assertIn("/-/blob/", self.notes["/merge_requests/2"][0]["body"])
 
     async def test_manual_draft_review_omits_whole_files_to_fit_the_selected_model(
