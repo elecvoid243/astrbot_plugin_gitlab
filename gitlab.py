@@ -33,6 +33,10 @@ class GitLab:
         self.web = ""
 
     async def request(self, method, path, *, params=None, body=None):
+        result, _ = await self._request(method, path, params=params, body=body)
+        return result
+
+    async def _request(self, method, path, *, params=None, body=None):
         async with self.session.request(
             method,
             self.instance + "/api/v4" + path,
@@ -43,7 +47,22 @@ class GitLab:
         ) as response:
             if not 200 <= response.status < 300:
                 raise APIError(response.status)
-            return await response.json()
+            return await response.json(), response.headers
+
+    async def _pages(self, path):
+        page = 1
+        while True:
+            rows, headers = await self._request(
+                "GET", self.root + path, params={"per_page": 100, "page": page}
+            )
+            yield rows
+            next_page = headers.get("X-Next-Page")
+            if next_page:
+                page = int(next_page)
+            elif next_page is None and len(rows) == 100:
+                page += 1
+            else:
+                return
 
     async def get(self, path="", **params):
         return await self.request("GET", self.root + path, params=params)
@@ -165,26 +184,37 @@ class GitLab:
             )
         )
 
-    async def marker_note(self, path, marker, bot_id):
-        page = 1
-        while True:
-            notes = await self.get(f"{path}/notes", per_page=100, page=page)
-            for note in notes:
-                if note.get("author", {}).get("id") == bot_id and marker in note.get(
-                    "body", ""
-                ):
-                    return note
-            if len(notes) < 100:
-                return None
-            page += 1
+    async def find_discussion(self, path, note_id):
+        async for groups in self._pages(f"{path}/discussions"):
+            for group in groups:
+                if any(note["id"] == note_id for note in group.get("notes", [])):
+                    return group["id"]
+        return ""
 
-    async def publish(self, path, thread, body, existing=None):
+    async def marker_note(self, path, marker, bot_id):
+        async for notes in self._pages(f"{path}/notes"):
+            for note in notes:
+                if (note.get("author") or {}).get("id") == bot_id and marker in (
+                    note.get("body") or ""
+                ).splitlines():
+                    return note
+        return None
+
+    async def publish_review(self, path, body, existing, *, as_thread):
         if existing:
-            return await self.request(
-                "PUT",
-                f"{self.root}{path}/notes/{int(existing['id'])}",
-                body={"body": body},
+            note_id = int(existing["id"])
+            # Updating by note ID also keeps a discussion note in its original thread.
+            await self.request(
+                "PUT", f"{self.root}{path}/notes/{note_id}", body={"body": body}
             )
+        elif as_thread:
+            await self.request(
+                "POST", f"{self.root}{path}/discussions", body={"body": body}
+            )
+        else:
+            await self.publish(path, "", body)
+
+    async def publish(self, path, thread, body):
         endpoint = (
             f"{path}/discussions/{quote(thread, safe='')}/notes"
             if thread

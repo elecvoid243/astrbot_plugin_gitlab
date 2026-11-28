@@ -39,6 +39,9 @@ DEFAULTS = dict(
     gitlab_provider="",
     gitlab_auto_issue=True,
     gitlab_auto_review=True,
+    publish_review_as_thread=False,
+    final_update_message=True,
+    reply_to_trigger_comment=False,
     unified_webhook_mode=True,
     webhook_uuid="",
 )
@@ -66,6 +69,15 @@ FIELDS = {
     },
     "gitlab_auto_issue": {"type": "bool", "description": "Issue 自动回复"},
     "gitlab_auto_review": {"type": "bool", "description": "MR 自动评审"},
+    "publish_review_as_thread": {
+        "type": "bool",
+        "description": "将新评审摘要发布为可解决讨论",
+    },
+    "final_update_message": {"type": "bool", "description": "发送评审摘要更新提示"},
+    "reply_to_trigger_comment": {
+        "type": "bool",
+        "description": "在命令所在讨论发送评审更新提示",
+    },
 }
 
 
@@ -202,7 +214,8 @@ class GitLabPlatform(Platform):
             with self.db:
                 self.db.execute(
                     "INSERT INTO jobs(id,payload) VALUES (?,?) ON CONFLICT(id) DO UPDATE SET "
-                    "payload=excluded.payload, attempts=0, due=0, state='queued' WHERE jobs.state='failed'",
+                    "payload=COALESCE(jobs.payload, excluded.payload), attempts=0, due=0, "
+                    "state='queued' WHERE jobs.state='failed'",
                     (f"{delivery}:{job['actor']}", json.dumps(job, ensure_ascii=False)),
                 )
             self.wake.set()
@@ -224,7 +237,7 @@ class GitLabPlatform(Platform):
                 continue
             key, payload, attempts = row
             try:
-                await self.process(json.loads(payload))
+                await self.process(json.loads(payload), key)
             except Exception as exc:
                 attempts += 1
                 state = "failed" if attempts >= 5 else "queued"
@@ -277,16 +290,80 @@ class GitLabPlatform(Platform):
                         raise
         return prepared.summary(result, version, self.api.web)
 
-    async def process(self, job):
+    def note_marker(self, identifier):
+        digest = hashlib.sha256(
+            (self.config["id"] + ":" + identifier).encode()
+        ).hexdigest()[:24]
+        return f"<!-- astrbot-gitlab:{digest} -->"
+
+    async def trigger_discussion(self, path, job, *, optional):
+        thread = job["thread"]
+        if thread or not job["key"].startswith("note:"):
+            return thread
+        # Some GitLab versions omit discussion_id in the Note Hook.
+        note_id = int(job["key"].split(":")[1])
+        try:
+            return await self.api.find_discussion(path, note_id)
+        except (APIError, aiohttp.ClientError, TimeoutError):
+            if not optional:
+                raise
+            return ""
+
+    async def finish_review_update(
+        self, path, job, delivery, summary_id, bot_id, *, thread=None
+    ):
+        if not self.config.get("final_update_message", True):
+            return
+        notice_marker = self.note_marker(f"review-update:{delivery}")
+        if job.get("review_update_note_id"):
+            if await self.api.marker_note(path, notice_marker, bot_id):
+                return
+        else:
+            # A newer review can update the summary while the notification waits to retry.
+            db = self.db
+            if db is None:
+                raise RuntimeError("GitLab job store is unavailable")
+            job["review_update_note_id"] = summary_id
+            with db:
+                db.execute(
+                    "UPDATE jobs SET payload=? WHERE id=?",
+                    (json.dumps(job, ensure_ascii=False), delivery),
+                )
+        url = f"{self.api.web}/-{path}#note_{int(summary_id)}"
+        body = f"已更新[评审摘要]({url})。\n\n{notice_marker}"
+        if self.config.get("reply_to_trigger_comment", False):
+            if thread is None:
+                thread = await self.trigger_discussion(path, job, optional=True)
+        else:
+            thread = ""
+        if thread:
+            try:
+                await self.api.publish(path, thread, body)
+            except (APIError, aiohttp.ClientError, TimeoutError):
+                # A server error may arrive after GitLab has already saved the reply.
+                if await self.api.marker_note(path, notice_marker, bot_id):
+                    return
+            else:
+                return
+        await self.api.publish(path, "", body)
+
+    async def process(self, job, delivery):
         """Resolve membership and pinned source before publishing one result.
 
         Args:
             job: Durable, project-scoped webhook work item.
+            delivery: Queue ID used to identify a retried review.
         """
         project = await self.api.get()
         if not await self.api.member(job["actor"], project):
             return
         path = f"/{job['resource']}/{job['iid']}"
+        if self.bot is None:
+            raise RuntimeError("GitLab bot identity is unavailable")
+        bot_id = self.bot["id"]
+        if summary_id := job.get("review_update_note_id"):
+            await self.finish_review_update(path, job, delivery, summary_id, bot_id)
+            return
         item = await self.api.get(path)
         is_mr = job["resource"] == "merge_requests"
         automatic = bool(job["sha"])
@@ -297,47 +374,39 @@ class GitLabPlatform(Platform):
             or job["sha"] != item["sha"]
         ):
             return
-        identifier = "review-summary" if automatic else job["key"]
-        digest = hashlib.sha256(
-            (self.config["id"] + ":" + identifier).encode()
-        ).hexdigest()[:24]
-        marker = f"<!-- astrbot-gitlab:{digest} -->"
-        current = await self.api.marker_note(path, marker, self.bot["id"])
-        diff_version = (
-            ReviewVersion.from_mr(item) if job["command"] == "review" else None
-        )
-        if job["command"] == "review" and not diff_version:
+        reviewing = is_mr and job["command"] == "review"
+        marker = self.note_marker("review-summary" if reviewing else job["key"])
+        current = await self.api.marker_note(path, marker, bot_id)
+        delivery_marker = self.note_marker(f"review-run:{delivery}")
+        updated_marker = "<!-- review-summary-updated -->"
+        if current and not reviewing:
+            return
+        if current and delivery_marker in current["body"]:
+            # Recover a save whose response was lost before we recorded it locally.
+            if updated_marker in current["body"]:
+                await self.finish_review_update(
+                    path, job, delivery, current["id"], bot_id
+                )
+            return
+        diff_version = ReviewVersion.from_mr(item) if reviewing else None
+        if reviewing and not diff_version:
             raise ValueError("MR diff version is not ready")
         version = (
             diff_version.marker
             if diff_version
             else f"<!-- head:{item.get('sha', '')} -->"
         )
-        if current and (not automatic or version in current["body"]):
+        thread = await self.trigger_discussion(path, job, optional=reviewing)
+        if not thread and not reviewing and job["key"].startswith("note:"):
             return
-        if job["key"].startswith("note:") and not job["thread"]:
-            # Some GitLab versions omit discussion_id in the Note Hook.
-            note_id = int(job["key"].split(":")[1])
-            page = 1
-            while not job["thread"]:
-                groups = await self.api.get(
-                    f"{path}/discussions", per_page=100, page=page
-                )
-                for group in groups:
-                    if any(note["id"] == note_id for note in group.get("notes", [])):
-                        job["thread"] = group["id"]
-                        break
-                if not job["thread"] and len(groups) < 100:
-                    return
-                page += 1
         if job["command"] == "help":
             body = HELP
         elif not is_mr and (
             not project.get("default_branch") or project.get("empty_repo")
         ):
             self.source.sha = ""
-            thread = await self.api.discussion(path, job["thread"])
-            body = await self.expert.analyze(job, item, discussion=thread)
+            discussion = await self.api.discussion(path, thread)
+            body = await self.expert.analyze(job, item, discussion=discussion)
         else:
             ref = (
                 f"refs/merge-requests/{job['iid']}/head"
@@ -355,9 +424,14 @@ class GitLabPlatform(Platform):
                 raise
             if is_mr and sha != item["sha"]:
                 raise ValueError("MR head changed during fetch")
-            thread = await self.api.discussion(path, job["thread"])
+            try:
+                discussion = await self.api.discussion(path, thread)
+            except (APIError, aiohttp.ClientError, TimeoutError):
+                if not reviewing:
+                    raise
+                discussion = ""
             if diff_version:
-                body = await self.review_mr(path, diff_version, job, item, thread)
+                body = await self.review_mr(path, diff_version, job, item, discussion)
                 if body is None:
                     return
             else:
@@ -367,7 +441,7 @@ class GitLabPlatform(Platform):
                     if not refs:
                         raise ValueError("MR diff version is not ready")
                     diff = await asyncio.to_thread(self.source.diff, refs.base)
-                body = await self.expert.analyze(job, item, diff, thread)
+                body = await self.expert.analyze(job, item, diff, discussion)
             if is_mr:
                 latest = await self.api.get(path)
                 if diff_version and ReviewVersion.from_mr(latest) != diff_version:
@@ -382,9 +456,27 @@ class GitLabPlatform(Platform):
                     or latest.get("work_in_progress")
                 ):
                     return
-        await self.api.publish(
-            path, job["thread"], f"{body}\n\n{marker}\n{version}", current
-        )
+        body = f"{body}\n\n{marker}\n{version}"
+        if reviewing:
+            body += f"\n{delivery_marker}"
+            if current:
+                body += f"\n{updated_marker}"
+            try:
+                await self.api.publish_review(
+                    path,
+                    body,
+                    current,
+                    as_thread=self.config.get("publish_review_as_thread", False),
+                )
+            except (APIError, aiohttp.ClientError, TimeoutError):
+                if not await self.api.marker_note(path, delivery_marker, bot_id):
+                    raise
+            if current:
+                await self.finish_review_update(
+                    path, job, delivery, current["id"], bot_id, thread=thread
+                )
+        else:
+            await self.api.publish(path, thread, body)
 
     async def send_by_session(self, session, message_chain):
         """Deliver text to a session in the bound issue or MR.

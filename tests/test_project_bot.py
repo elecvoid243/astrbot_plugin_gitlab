@@ -49,6 +49,12 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.head = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/merge-requests/2/head", self.head)
         self.notes = {}
+        self.review_threads = {}
+        self.reject_review_reply = False
+        self.reject_review_discussion_lookup = False
+        self.review_notes_second_page = False
+        self.lose_review_update_response = False
+        self.reject_next_review_notice = False
         self.calls = []
         self.reports = []
         self.model_requests = []
@@ -217,8 +223,28 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                     )
                 ]
             return web.json_response(data)
+        if path == "/merge_requests/2/discussions" and req.method == "POST":
+            payload = await req.json()
+            notes = self.notes.setdefault("/merge_requests/2", [])
+            note = dict(
+                id=len(notes) + 1,
+                author={"id": 77},
+                body=payload["body"],
+                type="DiscussionNote",
+                resolvable=True,
+                resolved=False,
+            )
+            thread = dict(id="summary-thread", individual_note=False, notes=[note])
+            self.review_threads[thread["id"]] = thread
+            notes.append(note)
+            return web.json_response(thread, status=201)
         if path.endswith("/discussions"):
-            return web.json_response([dict(id="abc", notes=[dict(id=101)])])
+            groups = [dict(id="abc", notes=[dict(id=101)])]
+            if path == "/merge_requests/2/discussions":
+                if self.reject_review_discussion_lookup:
+                    raise web.HTTPForbidden()
+                groups.extend(self.review_threads.values())
+            return web.json_response(groups)
         if path.endswith("/discussions/abc"):
             if self.advance_head_on_discussion:
                 self.advance_head_on_discussion = False
@@ -235,18 +261,38 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                     ]
                 )
             )
+        if (
+            self.reject_review_reply
+            and req.method == "POST"
+            and path == "/merge_requests/2/discussions/abc/notes"
+        ):
+            raise web.HTTPNotFound()
         if "/notes" in path:
             scope = "/".join(path.split("/")[:3])
             notes = self.notes.setdefault(scope, [])
             if req.method == "GET":
+                if self.review_notes_second_page and path == "/merge_requests/2/notes":
+                    page = req.query.get("page", "1")
+                    if page == "1":
+                        return web.json_response(
+                            notes[:1], headers={"X-Next-Page": "2"}
+                        )
+                    return web.json_response(notes[1:], headers={"X-Next-Page": ""})
                 return web.json_response(notes)
             payload = await req.json()
             if req.method == "POST":
+                if self.reject_next_review_notice and "#note_" in payload["body"]:
+                    self.reject_next_review_notice = False
+                    raise web.HTTPBadGateway()
                 note = dict(id=len(notes) + 1, author={"id": 77}, body=payload["body"])
                 notes.append(note)
             elif req.method == "PUT":
-                note = notes[int(path.split("/")[-1]) - 1]
+                note_id = int(path.split("/")[-1])
+                note = next(note for note in notes if note["id"] == note_id)
                 note["body"] = payload["body"]
+                if self.lose_review_update_response and scope == "/merge_requests/2":
+                    self.lose_review_update_response = False
+                    raise web.HTTPBadGateway()
             return web.json_response(note)
         raise web.HTTPNotFound()
 
@@ -306,12 +352,25 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         return SimpleNamespace(completion_text=json.dumps(result))
 
     async def deliver(self, payload, secret="test-hook"):
-        response = await self.client.post(
-            "/api/v1/webhooks/platforms/" + self.config["webhook_uuid"],
-            json=payload,
-            headers={"X-Gitlab-Token": secret},
-        )
+        response = await self.deliver_native(payload, secret=secret)
         return response.json(), response.status_code
+
+    async def deliver_native(self, payload, secret: str | None = "test-hook"):
+        path = "/api/v1/webhooks/platforms/" + self.config["webhook_uuid"]
+        headers = {"X-Gitlab-Token": secret} if secret else {}
+        return await self.client.post(path, json=payload, headers=headers)
+
+    def review_command(self, note_id, **attrs):
+        event = self.event(
+            "note",
+            noteable_type="MergeRequest",
+            action="create",
+            id=note_id,
+            note="/review",
+            **attrs,
+        )
+        event["merge_request"] = {"iid": 2}
+        return event
 
     def event(self, kind, **attrs) -> dict[str, Any]:
         return dict(
@@ -349,7 +408,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         event = self.event(
             "merge_request", action="open", iid=2, last_commit={"id": self.head}
         )
-        await self.deliver(event)
+        await self.deliver_native(event)
         await self.wait_done()
         self.assertNotIn("+++ b/caller.py", self.reports[0]["task"]["diff"])
         self.assertIn("caller.py", self.notes["/merge_requests/2"][0]["body"])
@@ -362,11 +421,252 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         event["object_attributes"].update(
             action="update", oldrev=previous, last_commit={"id": self.head}
         )
-        await self.deliver(event)
+        await self.deliver_native(event)
         await self.wait_done()
-        self.assertEqual(len(self.notes["/merge_requests/2"]), 1)
-        self.assertIn(self.head, self.notes["/merge_requests/2"][0]["body"])
+        await self.deliver_native(event)
+        await self.wait_done()
+        self.assertEqual(len(self.reports), 2)
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 2)
+        self.assertIn(self.head, notes[0]["body"])
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_1", notes[1]["body"]
+        )
         self.assertIn(("PUT", "/projects/8/merge_requests/2/notes/1"), self.calls)
+
+    async def test_manual_review_updates_automatic_summary_and_replay_is_idempotent(
+        self,
+    ):
+        opened = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+        self.assertEqual((await self.deliver_native(opened)).json(), {"accepted": True})
+        await self.wait_done()
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("return None", self.reports[0]["task"]["diff"])
+        self.assertIn("caller.py", notes[0]["body"])
+        self.adapter.config["publish_review_as_thread"] = True
+
+        command = self.review_command(101, discussion_id="abc")
+        await self.deliver_native(command)
+        await self.wait_done()
+        await self.deliver_native(command)
+        await self.wait_done()
+        self.assertEqual(len(self.reports), 2)
+        self.assertEqual(
+            self.reports[1]["task"]["diff"], self.reports[0]["task"]["diff"]
+        )
+        self.assertEqual(
+            self.calls.count(("PUT", "/projects/8/merge_requests/2/notes/1")), 1
+        )
+        self.assertFalse(
+            any(
+                method == "POST" and "/discussions" in path
+                for method, path in self.calls
+            )
+        )
+        self.assertEqual(len(notes), 2)
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_1", notes[1]["body"]
+        )
+        self.assertNotIn("caller.py", notes[1]["body"])
+
+    async def test_resolvable_summary_keeps_its_discussion_after_setting_changes(self):
+        self.adapter.config["publish_review_as_thread"] = True
+        await self.deliver_native(self.review_command(101, discussion_id="abc"))
+        await self.wait_done()
+        self.assertEqual(list(self.review_threads), ["summary-thread"])
+        summary = self.review_threads["summary-thread"]["notes"][0]
+        self.assertTrue(summary["resolvable"])
+        self.assertIn("caller.py", summary["body"])
+        original_body = summary["body"]
+        self.adapter.config.update(
+            publish_review_as_thread=False, reply_to_trigger_comment=True
+        )
+        self.reject_review_discussion_lookup = True
+
+        await self.deliver_native(self.review_command(102))
+        await self.wait_done()
+        update = self.calls.index(
+            ("PUT", f"/projects/8/merge_requests/2/notes/{summary['id']}")
+        )
+        self.assertEqual(
+            self.calls[update - 1], ("GET", "/projects/8/merge_requests/2")
+        )
+        self.assertNotEqual(summary["body"], original_body)
+        self.assertEqual(len(self.review_threads), 1)
+        self.assertEqual(len(self.reports), 2)
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_{summary['id']}",
+            self.notes["/merge_requests/2"][1]["body"],
+        )
+
+    async def test_update_link_goes_to_the_trigger_discussion(self):
+        await self.deliver_native(self.review_command(100))
+        await self.wait_done()
+        self.adapter.config["reply_to_trigger_comment"] = True
+
+        # This Note Hook has no discussion_id. GitLab lists the command in abc.
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+        self.assertIn(
+            ("POST", "/projects/8/merge_requests/2/discussions/abc/notes"), self.calls
+        )
+        self.assertEqual(
+            self.calls.count(("POST", "/projects/8/merge_requests/2/notes")), 1
+        )
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_1",
+            self.notes["/merge_requests/2"][1]["body"],
+        )
+
+    async def test_update_link_falls_back_when_lookup_or_reply_fails(self):
+        await self.deliver_native(self.review_command(100))
+        await self.wait_done()
+        self.adapter.config["reply_to_trigger_comment"] = True
+
+        self.reject_review_discussion_lookup = True
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+        self.assertNotIn(
+            ("POST", "/projects/8/merge_requests/2/discussions/abc/notes"), self.calls
+        )
+
+        self.reject_review_discussion_lookup = False
+        self.reject_review_reply = True
+        await self.deliver_native(self.review_command(102, discussion_id="abc"))
+        await self.wait_done()
+        self.assertIn(
+            ("POST", "/projects/8/merge_requests/2/discussions/abc/notes"), self.calls
+        )
+        self.assertEqual(
+            self.calls.count(("POST", "/projects/8/merge_requests/2/notes")), 3
+        )
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 3)
+        for notice in notes[1:]:
+            self.assertIn(
+                f"{self.origin}/team/demo/-/merge_requests/2#note_1", notice["body"]
+            )
+
+    async def test_members_can_review_drafts_with_automation_and_notices_disabled(self):
+        self.adapter.config.update(
+            gitlab_auto_review=False,
+            final_update_message=False,
+            reply_to_trigger_comment=True,
+        )
+        self.draft = True
+        opened = self.event(
+            "merge_request",
+            action="open",
+            iid=2,
+            last_commit={"id": self.head},
+            draft=True,
+        )
+        self.assertEqual(
+            (await self.deliver_native(opened)).json(), {"accepted": False}
+        )
+        manual = self.review_command(101, discussion_id="abc")
+        manual["user"]["id"] = 99
+        await self.deliver_native(manual)
+        await self.wait_done()
+        self.assertFalse(self.reports)
+        self.assertFalse(self.notes.get("/merge_requests/2"))
+
+        manual["user"]["id"] = 3
+        await self.deliver_native(manual)
+        await self.wait_done()
+        await self.deliver_native(self.review_command(102, discussion_id="abc"))
+        await self.wait_done()
+        self.assertEqual(len(self.reports), 2)
+        self.assertEqual(len(self.notes["/merge_requests/2"]), 1)
+        self.assertIn(("PUT", "/projects/8/merge_requests/2/notes/1"), self.calls)
+
+    async def test_marking_a_reviewed_draft_ready_runs_automatic_review_at_same_head(
+        self,
+    ):
+        self.draft = True
+        await self.deliver_native(self.review_command(101, discussion_id="abc"))
+        await self.wait_done()
+        self.draft = False
+        ready = self.event(
+            "merge_request", action="update", iid=2, last_commit={"id": self.head}
+        )
+        ready["changes"] = {"draft": {"previous": True, "current": False}}
+        self.assertEqual((await self.deliver_native(ready)).json(), {"accepted": True})
+        await self.wait_done()
+
+        self.assertEqual(len(self.reports), 2)
+        self.assertIn(("PUT", "/projects/8/merge_requests/2/notes/1"), self.calls)
+        self.assertEqual(len(self.notes["/merge_requests/2"]), 2)
+
+    async def test_updates_only_the_verified_legacy_summary_on_a_later_page(self):
+        legacy_marker = "<!-- astrbot-gitlab:92040a3ead789155be366e81 -->"
+        forged: dict[str, Any] = dict(
+            id=1, author={"id": 3}, body="Copied marker\n" + legacy_marker
+        )
+        legacy: dict[str, Any] = dict(
+            id=2, author={"id": 77}, body="Earlier automatic review\n" + legacy_marker
+        )
+        notes = self.notes["/merge_requests/2"] = [forged, legacy]
+        self.review_notes_second_page = True
+        await self.deliver_native(self.review_command(101, discussion_id="abc"))
+        await self.wait_done()
+
+        self.assertEqual(forged["body"], "Copied marker\n" + legacy_marker)
+        self.assertIn("caller.py", legacy["body"])
+        self.assertEqual(len(notes), 3)
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_2", notes[2]["body"]
+        )
+
+    async def test_saved_summary_is_not_rewritten_after_gitlab_loses_update_response(
+        self,
+    ):
+        await self.deliver_native(self.review_command(100))
+        await self.wait_done()
+        self.lose_review_update_response = True
+        await self.deliver_native(self.review_command(101, discussion_id="abc"))
+        await self.wait_done()
+
+        self.assertEqual(len(self.reports), 2)
+        self.assertEqual(
+            self.calls.count(("PUT", "/projects/8/merge_requests/2/notes/1")), 1
+        )
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 2)
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_1", notes[1]["body"]
+        )
+
+    async def test_notice_retry_does_not_rerun_a_review_after_a_newer_update(self):
+        await self.deliver_native(self.review_command(100))
+        await self.wait_done()
+        self.reject_next_review_notice = True
+        await self.deliver_native(self.review_command(101))
+        await self.wait(lambda: not self.reject_next_review_notice)
+
+        newer = self.review_command(102)
+        newer["object_attributes"]["note"] = "/review 检查新的评审请求"
+        await self.deliver_native(newer)
+        notes = self.notes["/merge_requests/2"]
+        await self.wait(lambda: len(notes) == 2)
+        newer_body = notes[0]["body"]
+
+        await self.adapter.terminate()
+        self.adapter = GitLabPlatform(self.config, {}, asyncio.Queue())
+        self.runner = asyncio.create_task(self.adapter.run())
+        self.addAsyncCleanup(self.adapter.terminate)
+        await self.wait(lambda: self.adapter.bot)
+        await self.wait_done()
+        self.assertEqual(len(self.reports), 3)
+        self.assertEqual(self.reports[-1]["task"]["question"], "检查新的评审请求")
+        self.assertEqual(notes[0]["body"], newer_body)
+        self.assertEqual(
+            self.calls.count(("PUT", "/projects/8/merge_requests/2/notes/1")), 2
+        )
+        self.assertEqual(len(notes), 3)
 
     async def test_stale_result_and_unauthorized_actor(self):
         event = self.event(
@@ -604,16 +904,24 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         registered = next(
             platform for platform in platform_registry if platform.name == "gitlab"
         )
-        self.assertEqual(
-            registered.config_metadata["gitlab_provider"]["_special"], "select_provider"
-        )
-        self.assertTrue(registered.default_config_tmpl["gitlab_auto_review"])
+        metadata = registered.config_metadata
+        defaults = registered.default_config_tmpl
+        assert metadata is not None and defaults is not None
+        self.assertEqual(metadata["gitlab_provider"]["_special"], "select_provider")
+        self.assertTrue(defaults["gitlab_auto_review"])
+        self.assertTrue(defaults["final_update_message"])
+        for key in ("publish_review_as_thread", "reply_to_trigger_comment"):
+            self.assertFalse(defaults[key])
+            self.assertEqual(metadata[key]["type"], "bool")
         event = self.event(
             "note", noteable_type="Issue", action="create", id=101, note="/help"
         )
         event["issue"] = {"iid": 1}
-        self.assertEqual((await self.deliver(event, secret=""))[1], 403)
-        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        self.assertEqual(
+            (await self.deliver_native(event, secret=None)).status_code, 403
+        )
+        res = await self.deliver_native(event)
+        self.assertEqual((res.status_code, res.json()), (200, {"accepted": True}))
         await self.wait_done()
         self.assertIn(
             ("POST", "/projects/8/issues/1/discussions/abc/notes"), self.calls
