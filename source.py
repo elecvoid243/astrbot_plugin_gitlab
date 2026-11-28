@@ -6,7 +6,7 @@ import re
 import sqlite3
 import subprocess
 from collections.abc import Callable, Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -18,28 +18,27 @@ class FilePatch:
     path: str
     status: str
     text: str | None
+    complete: bool = True
 
 
 def patch_sections(
     readline: Callable[[int], bytes], max_bytes: int
-) -> Iterator[str | None]:
+) -> Iterator[tuple[str, bool]]:
     section = bytearray()
-    oversized = False
+    complete = True
     line_start = True
     for part in iter(lambda: readline(64 * 1024), b""):
-        if line_start and part.startswith(b"diff --git ") and (section or oversized):
-            yield None if oversized else section.decode("utf-8", "replace")
+        if line_start and part.startswith(b"diff --git ") and (section or not complete):
+            yield section.decode("utf-8", "replace"), complete
             section.clear()
-            oversized = False
-        if not oversized:
-            if len(section) + len(part) > max_bytes:
-                section.clear()
-                oversized = True
-            else:
-                section.extend(part)
+            complete = True
+        if complete:
+            room = max_bytes - len(section)
+            section.extend(part[:room])
+            complete = len(part) <= room
         line_start = part.endswith(b"\n")
-    if section or oversized:
-        yield None if oversized else section.decode("utf-8", "replace")
+    if section or not complete:
+        yield section.decode("utf-8", "replace"), complete
 
 
 class SourceIndex:
@@ -338,10 +337,11 @@ class SourceIndex:
                 raise RuntimeError("Git diff failed")
             return raw.decode("utf-8", "replace")
 
+    @contextmanager
     def review_patches(
         self, base: str, head: str, max_patch_bytes: int
-    ) -> Iterator[FilePatch]:
-        """Yield pinned per-file patches, preserving paths too large to buffer."""
+    ) -> Iterator[Callable[[], Iterator[FilePatch]]]:
+        """Allow sequential passes through one pinned Git comparison."""
         options = (
             "-c",
             "core.quotePath=false",
@@ -377,16 +377,20 @@ class SourceIndex:
             )
             if proc.returncode:
                 raise RuntimeError(f"Git diff failed with status {proc.returncode}")
-            output.seek(0)
-            sections = patch_sections(output.readline, max_patch_bytes)
-            for path, status in changes:
-                text = next(sections)
-                if status == "T":
-                    # Git renders a type change as a deletion and an addition.
-                    after = next(sections)
-                    text = (
-                        text + after if text is not None and after is not None else None
-                    )
-                yield FilePatch(path, status, text)
-            if next(sections, "") != "":
-                raise RuntimeError("Git produced more patches than file changes")
+
+            def patches() -> Iterator[FilePatch]:
+                output.seek(0)
+                sections = patch_sections(output.readline, max_patch_bytes)
+                for path, status in changes:
+                    text, complete = next(sections)
+                    if status == "T":
+                        # Git renders a type change as a deletion and an addition.
+                        after, after_complete = next(sections)
+                        if complete:
+                            text += after
+                            complete = after_complete
+                    yield FilePatch(path, status, text, complete)
+                if next(sections, None) is not None:
+                    raise RuntimeError("Git produced more patches than file changes")
+
+            yield patches

@@ -40,6 +40,9 @@ DEFAULTS = dict(
     gitlab_auto_issue=True,
     gitlab_auto_review=True,
     ignore_language_framework=[],
+    enable_large_pr_chunking=False,
+    max_number_of_calls=3,
+    large_patch_policy="clip",
     publish_review_as_thread=False,
     final_update_message=True,
     reply_to_trigger_comment=False,
@@ -74,6 +77,18 @@ FIELDS = {
         "type": "list",
         "description": "在 MR 评审中排除所选框架的生成文件",
         "options": list(GENERATED_FRAMEWORK_GLOBS),
+    },
+    "enable_large_pr_chunking": {"type": "bool", "description": "启用大型 MR 分块评审"},
+    "max_number_of_calls": {
+        "type": "int",
+        "description": "分块评审的最大计划批数",
+        "hint": "仅在启用分块时生效，至少为 1",
+    },
+    "large_patch_policy": {
+        "type": "string",
+        "description": "单文件超出分块评审预算时的处理方式",
+        "options": ["clip", "skip"],
+        "hint": "仅在启用分块时生效，clip 为裁剪，skip 为跳过",
     },
     "publish_review_as_thread": {
         "type": "bool",
@@ -270,6 +285,13 @@ class GitLabPlatform(Platform):
     async def review_mr(self, path, version, job, item, discussion):
         provider = self.context.get_provider_by_id(self.config["gitlab_provider"])
         budget = ReviewBudget.for_provider(provider)
+        max_batches = 1
+        chunking = bool(self.config.get("enable_large_pr_chunking"))
+        if chunking:
+            configured_batches = self.config.get("max_number_of_calls")
+            if configured_batches is None:
+                configured_batches = DEFAULTS["max_number_of_calls"]
+            max_batches = max(1, int(configured_batches))
         prepared = await asyncio.to_thread(
             prepare_review,
             self.source,
@@ -279,28 +301,31 @@ class GitLabPlatform(Platform):
             item,
             discussion,
             frameworks=self.config.get("ignore_language_framework") or (),
+            max_batches=max_batches,
+            clip_large_patches=chunking
+            and self.config.get("large_patch_policy") != "skip",
         )
         if ReviewVersion.from_mr(await self.api.get(path)) != version:
             return None
 
-        result = {"findings": []}
-        if prepared.prompt:
+        results = []
+        for batch in prepared.batches:
             for system in (REVIEW_REPORT, REVIEW_RETRY):
                 reply = await self.request_completion(
                     system,
-                    prepared.prompt,
+                    batch.prompt,
                     output_limit=budget.output,
                     llm_params=budget.llm_params,
                 )
                 if getattr(reply, "usage_matches_request", True) is False:
                     return "评审失败。模型提供商重试时缩减了原始输入，本次没有确认任何文件的评审覆盖。"
                 try:
-                    result = decode_review(reply.completion_text)
+                    results.append(decode_review(reply.completion_text))
                     break
                 except (TypeError, ValueError):
                     if system == REVIEW_RETRY:
                         raise
-        return prepared.summary(result, version, self.api.web)
+        return prepared.summary(results, version, self.api.web)
 
     def note_marker(self, identifier):
         digest = hashlib.sha256(

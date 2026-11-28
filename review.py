@@ -1,9 +1,9 @@
-"""Plan one model-budgeted review of a pinned MR comparison."""
+"""Plan and summarize model-budgeted batches of a pinned MR comparison."""
 
 import json
 import re
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from itertools import chain
 from typing import Self
@@ -15,7 +15,7 @@ from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
 from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.utils.llm_metadata import LLM_METADATAS
 
-from .expert import decode, render_findings
+from .expert import MAX_FINDINGS, decode, render_finding
 from .review_files import excluded_from_review
 from .source import FilePatch, SourceIndex
 
@@ -35,6 +35,8 @@ ASSIGNMENT = re.compile(
     re.M,
 )
 DECLARATION = re.compile(r"^\d+:[ \t]*(?:async[ \t]+)?(?:def|function|fn|func)[ \t]+")
+CHANGED_HUNK = re.compile(r"^@@ [^\n]*\n(?:[ \\][^\n]*\n)*[+-][^\n]*\n", re.M)
+CLIPPED_PATCH = "[补丁已裁剪]\n"
 TOKEN_COUNTER = EstimateTokenCounter()
 
 
@@ -107,22 +109,35 @@ class ReviewBudget:
 
 
 @dataclass
-class PreparedReview:
-    prompt: str | None
+class PreparedBatch:
+    prompt: str
     evidence: dict
+    coverage: dict[str, bool]
+
+
+@dataclass
+class PreparedReview:
+    batches: list[PreparedBatch]
     omitted: list[str]
     filtered: list[str]
     deleted: list[str]
 
-    def summary(self, result: dict, version: ReviewVersion, web_url: str) -> str:
-        lines = render_findings(result["findings"], self.evidence)
+    def summary(self, results: list[dict], version: ReviewVersion, web_url: str) -> str:
+        lines = merge_findings(self.batches, results)
         if not lines:
             lines.append(
                 "在本次评审覆盖的差异中未发现可确认的问题。"
-                if self.prompt
+                if self.batches
                 else "本次没有提交给模型评审的文件补丁。"
             )
+        clipped = [
+            path
+            for batch in self.batches
+            for path, complete in batch.coverage.items()
+            if not complete
+        ]
         for label, paths in (
+            ("部分评审的文件", clipped),
             ("预算遗漏的文件", self.omitted),
             ("仅以文件名列出的删除文件", self.deleted),
             ("按文件规则过滤的文件", self.filtered),
@@ -134,6 +149,40 @@ class PreparedReview:
             f"，比较基线 `{version.base}`。"
         )
         return "\n\n".join(lines)
+
+
+def merge_findings(batches: list[PreparedBatch], results: list[dict]) -> list[str]:
+    merged: list[tuple[str, dict[str, dict]]] = []
+    for batch, result in zip(batches, results, strict=True):
+        for finding in result["findings"]:
+            if not isinstance(finding, dict) or not finding.get("text"):
+                continue
+            message = " ".join(str(finding["text"]).split())
+            refs = finding.get("refs")
+            rows = {}
+            if isinstance(refs, list):
+                for ref in refs[:5]:
+                    if row := batch.evidence.get(str(ref)):
+                        rows[row["url"]] = row
+            # IDs are scoped to the request. Only resolved links establish that
+            # two grounded findings with the same wording share a location.
+            matches = [
+                entry
+                for entry in merged
+                if entry[0] == message and rows.keys() & entry[1].keys()
+            ]
+            if not matches:
+                merged.append((message, rows))
+                continue
+            first, *duplicates = matches
+            first[1].update(rows)
+            for duplicate in duplicates:
+                first[1].update(duplicate[1])
+                merged.remove(duplicate)
+    return [
+        render_finding(message, rows.values())
+        for message, rows in merged[:MAX_FINDINGS]
+    ]
 
 
 def format_path(path: str) -> str:
@@ -191,6 +240,40 @@ def choose_patches(
     return selected, omitted
 
 
+def clip_patch(
+    patch: FilePatch, task: dict, limit: int, evidence: dict | None = None
+) -> FilePatch:
+    text = patch.text
+    if not text:
+        return patch
+    rows = evidence or {}
+    existing_diff = task["diff"]
+    if patch.complete or text.endswith(CLIPPED_PATCH):
+        if (
+            estimate_tokens(render_prompt({**task, "diff": existing_diff + text}, rows))
+            <= limit
+        ):
+            return patch
+    if not patch.complete:
+        text = text.removesuffix(CLIPPED_PATCH)
+
+    # End at a complete line, including when the Git reader cut off mid-line.
+    ends = [match.end() for match in re.finditer("\n", text)]
+    low, high = 0, len(ends)
+    while low < high:
+        middle = (low + high) // 2
+        prefix = text[: ends[middle]] + CLIPPED_PATCH
+        prompt = render_prompt({**task, "diff": existing_diff + prefix}, rows)
+        if estimate_tokens(prompt) <= limit:
+            low = middle + 1
+        else:
+            high = middle
+    prefix = text[: ends[low - 1]] if low else ""
+    if CHANGED_HUNK.search(prefix):
+        return replace(patch, text=prefix + CLIPPED_PATCH, complete=False)
+    return replace(patch, text=None, complete=False)
+
+
 def patch_text(patches: list[FilePatch]) -> str:
     return "".join(patch.text or "" for patch in patches)
 
@@ -226,7 +309,16 @@ def related_references(
             )
             line, match = invocation or matches[0]
             start = max(0, match.start() - 45)
-            yield {**row, "text": line[start : start + 160]}, invocation is not None
+            line_number = line.split(":", 1)[0]
+            yield (
+                {
+                    **row,
+                    "label": f"{row['path']} L{line_number}",
+                    "line_url": f"{row['url'].split('#', 1)[0]}#L{line_number}-{line_number}",
+                    "text": line[start : start + 160],
+                },
+                invocation is not None,
+            )
 
 
 def evidence_candidates(
@@ -256,6 +348,8 @@ def prepare_review(
     discussion: str,
     *,
     frameworks: Sequence[str] = (),
+    max_batches: int,
+    clip_large_patches: bool,
 ) -> PreparedReview:
     task = dict(
         command="review",
@@ -276,20 +370,52 @@ def prepare_review(
     exclude_path = partial(excluded_from_review, frameworks=frameworks)
     filtered: set[str] = set()
     deleted: set[str] = set()
+    batches = []
+    omitted = []
+    pending = None
+    # At four UTF-8 bytes per character and 0.3 tokens per character,
+    # a patch larger than this reader limit cannot fit intact.
+    with source.review_patches(
+        version.base, version.head, budget.window * 16
+    ) as patches:
 
-    # Even at four UTF-8 bytes per character the estimator charges at least
-    # 0.3 tokens per character, so longer raw patches cannot fit this window.
-    def changes():
-        for patch in source.review_patches(
-            version.base, version.head, budget.window * 16
-        ):
-            if exclude_path(patch.path):
-                filtered.add(patch.path)
-            elif patch.status == "D":
-                deleted.add(patch.path)
-            else:
-                yield patch
+        def changes():
+            for patch in patches():
+                if exclude_path(patch.path):
+                    filtered.add(patch.path)
+                elif patch.status == "D":
+                    deleted.add(patch.path)
+                elif pending is None or patch.path in pending:
+                    yield patch
 
+        for _ in range(max_batches):
+            batch, omitted = prepare_batch(
+                source,
+                changes,
+                task,
+                limit,
+                exclude_path=exclude_path,
+                clip_large_patches=clip_large_patches,
+            )
+            if batch is None:
+                break
+            batches.append(batch)
+            if not omitted:
+                break
+            pending = set(omitted)
+    return PreparedReview(
+        batches, omitted=omitted, filtered=sorted(filtered), deleted=sorted(deleted)
+    )
+
+
+def select_patches(
+    source: SourceIndex,
+    changes: Callable[[], Iterator[FilePatch]],
+    task: dict,
+    limit: int,
+    *,
+    exclude_path: Callable[[str], bool],
+) -> tuple[list[FilePatch], list[str], dict | None]:
     references: dict[str, tuple[FilePatch, dict]] = {}
 
     def discover_references():
@@ -299,25 +425,34 @@ def prepare_review(
                     kind = "call" if is_call else "reference"
                     if kind in references:
                         continue
-                    # Keep the initial plan when a patch cannot coexist even
-                    # with a single compact reference.
-                    minimal = render_prompt(
-                        {**task, "diff": patch.text}, {"E1": prompt_evidence(row)}
-                    )
-                    if estimate_tokens(minimal) > limit:
-                        continue
-                    references[kind] = (patch, row)
+                    compact = {"E1": prompt_evidence(row)}
+                    anchor = patch
+                    if (
+                        estimate_tokens(
+                            render_prompt({**task, "diff": patch.text}, compact)
+                        )
+                        > limit
+                    ):
+                        if patch.complete:
+                            continue
+                        # A prefix can give up tail lines to preserve a caller
+                        # when the change that prompted the lookup stays visible.
+                        anchor = clip_patch(patch, task, limit, compact)
+                        if not anchor.text or patch_symbols(anchor) != patch_symbols(
+                            patch
+                        ):
+                            continue
+                    references[kind] = (anchor, row)
                     if is_call:
                         break
             yield patch
 
     selected, omitted = choose_patches(discover_references(), task, {}, limit)
-    evidence = {}
-    source_rows = {}
     related = references.get("call") or references.get("reference")
+    row = None
     if related:
         anchor, row = related
-        evidence["E1"] = prompt_evidence(row)
+        evidence = {"E1": prompt_evidence(row)}
         if (
             anchor not in selected
             or estimate_tokens(
@@ -332,19 +467,74 @@ def prepare_review(
             selected, omitted = choose_patches(
                 chain((anchor,), remaining_changes), task, evidence, limit
             )
-        source_rows["E1"] = row
+
+    return selected, omitted, row
+
+
+def prepare_batch(
+    source: SourceIndex,
+    changes: Callable[[], Iterator[FilePatch]],
+    task: dict,
+    limit: int,
+    *,
+    exclude_path: Callable[[str], bool],
+    clip_large_patches: bool,
+) -> tuple[PreparedBatch | None, list[str]]:
+    oversized = set()
+
+    def intact_patches():
+        for patch in changes():
+            if not patch.complete or (
+                clip_large_patches
+                and patch.text
+                and estimate_tokens(render_prompt({**task, "diff": patch.text}, {}))
+                > limit
+            ):
+                oversized.add(patch.path)
+                yield replace(patch, text=None)
+            else:
+                yield patch
+
+    selected, omitted, related = select_patches(
+        source, intact_patches, task, limit, exclude_path=exclude_path
+    )
+    if clip_large_patches and oversized:
+
+        def oversized_patches():
+            return (patch for patch in changes() if patch.path in oversized)
+
+        if selected:
+            # Preserve complete patches and their caller evidence before spending
+            # the remaining space on prefixes.
+            evidence = {"E1": prompt_evidence(related)} if related else {}
+            for patch in oversized_patches():
+                clipped_patch = clip_patch(
+                    patch, {**task, "diff": patch_text(selected)}, limit, evidence
+                )
+                if clipped_patch.text:
+                    selected.append(clipped_patch)
+        else:
+
+            def clipped_patches():
+                return (clip_patch(patch, task, limit) for patch in oversized_patches())
+
+            selected, _, related = select_patches(
+                source, clipped_patches, task, limit, exclude_path=exclude_path
+            )
+        clipped = {patch.path for patch in selected if not patch.complete}
+        omitted = [path for path in omitted if path not in clipped]
 
     if not selected:
-        return PreparedReview(
-            None,
-            {},
-            omitted=omitted,
-            filtered=sorted(filtered),
-            deleted=sorted(deleted),
-        )
+        return None, omitted
 
-    task["diff"] = patch_text(selected)
-    urls = {row["url"] for row in source_rows.values()}
+    task = {**task, "diff": patch_text(selected)}
+    evidence = {}
+    source_rows = {}
+    urls = set()
+    if related:
+        evidence["E1"] = prompt_evidence(related)
+        source_rows["E1"] = {**related, "url": related["line_url"]}
+        urls.add(related["url"])
     # Evidence only adds JSON between the empty map's braces. Count that
     # rendered fragment against the remaining capacity, allowing for rounding.
     remaining = limit - estimate_tokens(render_prompt(task, {})) - 1
@@ -365,13 +555,11 @@ def prepare_review(
     prompt = render_prompt(task, evidence)
     if estimate_tokens(prompt) > limit:
         raise RuntimeError("Rendered review exceeds the model input budget")
-    return PreparedReview(
+    return PreparedBatch(
         prompt,
         source_rows,
-        omitted=omitted,
-        filtered=sorted(filtered),
-        deleted=sorted(deleted),
-    )
+        {patch.path: patch.complete for patch in selected},
+    ), omitted
 
 
 def decode_review(text: str) -> dict:

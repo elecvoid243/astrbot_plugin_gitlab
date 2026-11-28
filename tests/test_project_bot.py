@@ -61,6 +61,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.calls = []
         self.reports = []
         self.model_requests = []
+        self.review_findings = None
         self.change_during_review = False
         self.advance_head_on_discussion = False
         self.base_after_review = None
@@ -348,6 +349,8 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                     tokens + output_limit,
                     self.provider.provider_config["max_context_tokens"],
                 )
+                if self.review_findings:
+                    result["findings"] = self.review_findings(prompt)
         return SimpleNamespace(completion_text=json.dumps(result))
 
     async def deliver(self, payload, secret="test-hook"):
@@ -979,6 +982,261 @@ class TestProjectBot(IsolatedAsyncioTestCase):
 
         self.assertFalse(self.model_requests)
         self.assertFalse(self.notes.get("/merge_requests/2"))
+
+    def commit_review_files(self, files):
+        self.git("switch", "--detach", self.base)
+        for filename, contents in files.items():
+            (self.work / filename).write_text(contents, encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-m", "Prepare review patches")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+
+    async def test_review_chunking_is_opt_in_and_respects_the_project_batch_limit(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        files = {
+            f"{letter}_events.txt": "".join(
+                f"{letter} event {i:02d}: {letter * 40}\n" for i in range(34)
+            )
+            for letter in "abcd"
+        }
+        self.commit_review_files(files)
+        self.adapter.config["final_update_message"] = False
+
+        for note_id, config, batches in (
+            (101, {}, 1),
+            (102, {"enable_large_pr_chunking": True}, 3),
+            (103, {"max_number_of_calls": 2}, 2),
+        ):
+            with self.subTest(batches=batches):
+                self.adapter.config.update(config)
+                self.model_requests.clear()
+                self.reports.clear()
+                response = await self.deliver_native(self.review_command(note_id))
+                self.assertEqual(
+                    (response.status_code, response.json()), (200, {"accepted": True})
+                )
+                await self.wait_done()
+
+                self.assertEqual(len(self.model_requests), batches)
+                notes = self.notes["/merge_requests/2"]
+                self.assertEqual(len(notes), 1)
+                body = notes[0]["body"]
+                self.assertIn("预算遗漏的文件", body)
+                for report, letter in zip(self.reports, "abcd"):
+                    diff = report["task"]["diff"]
+                    self.assertIn(f"+{letter} event 33: {letter * 40}", diff)
+                    self.assertEqual(diff.count("diff --git "), 1)
+                    self.assertNotIn(f"`{letter}_events.txt`", body)
+                for filename in list(files)[batches:]:
+                    self.assertIn(f"`{filename}`", body)
+
+        self.provider.provider_config["max_context_tokens"] = 24000
+        self.model_requests.clear()
+        self.reports.clear()
+        await self.deliver_native(self.review_command(104))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        diff = self.reports[0]["task"]["diff"]
+        for filename in files:
+            self.assertIn(f"+++ b/{filename}", diff)
+        self.assertNotIn("预算遗漏", self.notes["/merge_requests/2"][0]["body"])
+
+    async def test_chunked_review_reports_distinct_file_coverage(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        self.adapter.config.update(enable_large_pr_chunking=True, max_number_of_calls=2)
+        (self.work / "vendor").mkdir()
+        files = {
+            f"{letter}_events.txt": "".join(
+                f"{letter} event {i:02d}: {letter * 40}\n" for i in range(34)
+            )
+            for letter in "abc"
+        }
+        files["d_large.txt"] = "large changed line\n" * 3000
+        files["vendor/ignored.py"] = "FILTERED_PATCH_SENTINEL\n" * 3000
+        self.commit_review_files(files)
+        self.git("rm", "caller.py")
+        self.git("commit", "--amend", "--no-edit")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+
+        response = await self.deliver_native(self.review_command(101))
+        self.assertEqual(
+            (response.status_code, response.json()), (200, {"accepted": True})
+        )
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertNotIn("FILTERED_PATCH_SENTINEL", json.dumps(self.reports))
+        body = self.notes["/merge_requests/2"][0]["body"]
+        for heading, path in (
+            ("部分评审的文件", "d_large.txt"),
+            ("预算遗漏的文件", "c_events.txt"),
+            ("仅以文件名列出的删除文件", "caller.py"),
+            ("按文件规则过滤的文件", "vendor/ignored.py"),
+        ):
+            self.assertIn(f"**{heading}**\n\n- `{path}`", body)
+            self.assertEqual(body.count(f"`{path}`"), 1)
+
+    async def test_review_clips_only_analyzable_prefixes_or_skips_oversized_files(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        self.commit_review_files(
+            {
+                "service.py": (
+                    "def find_order(key):\n    return None\n"
+                    + "".join(f"# event {i:04d}: {'x' * 40}\n" for i in range(1000))
+                ),
+                "wide_line.txt": "y" * 40000 + "\nsecond line\n",
+            }
+        )
+        self.adapter.config.update(
+            enable_large_pr_chunking=True, final_update_message=False
+        )
+
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("+# event 0000: " + "x" * 40 + "\n", diff)
+        self.assertNotIn("+# event 0999", diff)
+        self.assertNotIn("wide_line.txt", diff)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("部分评审的文件**\n\n- `service.py`", body)
+        self.assertIn(f"/-/blob/{self.head}/caller.py#L", body)
+        self.assertIn("预算遗漏的文件**\n\n- `wide_line.txt`", body)
+
+        self.model_requests.clear()
+        self.adapter.config["large_patch_policy"] = "skip"
+        await self.deliver_native(self.review_command(102))
+        await self.wait_done()
+
+        self.assertFalse(self.model_requests)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertNotIn("部分评审的文件", body)
+        self.assertIn("预算遗漏的文件**\n\n- `service.py`\n- `wide_line.txt`", body)
+
+    async def test_review_keeps_complete_patches_ahead_of_oversized_prefixes(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        files = {
+            f"a_{index}_large.txt": "an event to review\n" * 2000 for index in range(3)
+        }
+        files.update({f"z_{index}_small.txt": "small change\n" for index in range(6)})
+        self.commit_review_files(files)
+        self.adapter.config.update(enable_large_pr_chunking=True, max_number_of_calls=1)
+
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        diff = self.reports[0]["task"]["diff"]
+        for index in range(6):
+            self.assertIn(
+                f"+++ b/z_{index}_small.txt\n@@ -0,0 +1 @@\n+small change", diff
+            )
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("部分评审的文件**\n\n- `a_0_large.txt`", body)
+        self.assertIn("预算遗漏的文件**\n\n- `a_1_large.txt`\n- `a_2_large.txt`", body)
+
+    async def test_review_merges_findings_by_pinned_evidence_across_batches(self):
+        self.git("switch", "--detach", self.base)
+        with (self.work / "caller.py").open("a") as caller:
+            caller.write("print(calculate_total(42))\n")
+        (self.work / "shared.py").write_text("print(common_check())\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "Add unchanged callers and shared requirements")
+        self.base = self.git("rev-parse", "HEAD")
+        padding = "".join(f"# event {i:02d}: {'x' * 50}\n" for i in range(32))
+        common_check = "def common_check():\n    return True\n\n"
+        self.commit_review_files(
+            {
+                "a_orders.py": "def find_order(key):\n    return key\n\n"
+                + common_check
+                + padding,
+                "b_totals.py": "def calculate_total(key):\n    return key\n\n"
+                + common_check
+                + padding,
+                "c_checks.py": common_check + padding,
+            }
+        )
+        self.provider.provider_config["max_context_tokens"] = 2000
+        self.adapter.config["enable_large_pr_chunking"] = True
+
+        def findings(prompt):
+            evidence = prompt["evidence"]
+            if "+++ b/c_checks.py" in prompt["task"]["diff"]:
+                self.assertTrue(evidence["E1"]["label"].startswith("shared.py "))
+                return [{"text": "需要统一检查", "refs": ["E1"]}]
+            self.assertTrue(evidence["E1"]["label"].startswith("caller.py "))
+            shared = next(
+                ref
+                for ref, row in evidence.items()
+                if row["label"].startswith("shared.py ")
+            )
+            return [
+                {"text": "需要检查调用", "refs": ["E1", "E999"]},
+                {"text": "需要统一检查", "refs": [shared, "E1"]},
+                {"text": "需要人工核对", "refs": ["E999"]},
+            ]
+
+        self.review_findings = findings
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 3)
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 1)
+        lines = notes[0]["body"].splitlines()
+        same_wording = [line for line in lines if line.startswith("- 需要检查调用")]
+        self.assertEqual(len(same_wording), 2)
+        caller_url = f"/-/blob/{self.head}/caller.py"
+        self.assertIn(f"{caller_url}#L2-2>", same_wording[0])
+        self.assertIn(f"{caller_url}#L3-3>", same_wording[1])
+        merged = [line for line in lines if line.startswith("- 需要统一检查")]
+        self.assertEqual(len(merged), 1)
+        for url in (
+            f"/-/blob/{self.head}/shared.py#L",
+            f"{caller_url}#L2-2>",
+            f"{caller_url}#L3-3>",
+        ):
+            self.assertEqual(merged[0].count(url), 1)
+        # Same wording without a verified location does not prove two reports agree.
+        self.assertEqual(lines.count("- 需要人工核对 （待核实）"), 2)
+        self.assertNotIn("E999", notes[0]["body"])
+
+    async def test_review_caps_merged_findings_without_dropping_coverage(self):
+        self.provider.provider_config["max_context_tokens"] = 1600
+        self.commit_review_files(
+            {
+                f"{letter}_events.txt": "".join(
+                    f"{letter} event {i:02d}: {letter * 40}\n" for i in range(38)
+                )
+                for letter in "abc"
+            }
+        )
+        self.adapter.config.update(enable_large_pr_chunking=True, max_number_of_calls=2)
+
+        def findings(prompt):
+            if "+++ b/a_events.txt" in prompt["task"]["diff"]:
+                self.assertIn("E1", prompt["evidence"])
+                duplicate = {"text": "重复发现", "refs": ["E1"]}
+                return [duplicate] * 6 + [
+                    {"text": f"第一批发现 {i}", "refs": []} for i in range(4)
+                ]
+            return [{"text": f"第二批发现 {i}", "refs": []} for i in range(8)]
+
+        self.review_findings = findings
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 2)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        lines = body.splitlines()
+        self.assertEqual(sum(line.startswith("- 重复发现") for line in lines), 1)
+        self.assertEqual(sum(line.startswith("- 第一批发现") for line in lines), 4)
+        self.assertEqual(sum(line.startswith("- 第二批发现") for line in lines), 3)
+        self.assertIn("预算遗漏的文件**\n\n- `c_events.txt`", body)
 
     async def test_review_prefers_complete_patches_to_extra_source_excerpts(self):
         self.provider.provider_config["max_context_tokens"] = 1800
