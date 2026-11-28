@@ -57,6 +57,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.reject_review_discussion_lookup = False
         self.review_notes_second_page = False
         self.lose_review_update_response = False
+        self.lose_next_review_post_response = False
         self.reject_next_review_notice = False
         self.calls = []
         self.reports = []
@@ -290,6 +291,9 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                     raise web.HTTPBadGateway()
                 note = dict(id=len(notes) + 1, author={"id": 77}, body=payload["body"])
                 notes.append(note)
+                if self.lose_next_review_post_response and scope == "/merge_requests/2":
+                    self.lose_next_review_post_response = False
+                    raise web.HTTPBadGateway()
             elif req.method == "PUT":
                 note_id = int(path.split("/")[-1])
                 note = next(note for note in notes if note["id"] == note_id)
@@ -965,6 +969,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertIn("本次没有提交给模型评审的文件补丁。", body)
         self.assertIn("仅以文件名列出的删除文件**\n\n- `service.py`", body)
         self.assertNotIn("预算遗漏", body)
+        self.assertNotIn("失败批次", body)
 
     async def test_manual_review_drops_result_when_head_changes_during_collection(self):
         event = self.event(
@@ -1042,6 +1047,253 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         for filename in files:
             self.assertIn(f"+++ b/{filename}", diff)
         self.assertNotIn("预算遗漏", self.notes["/merge_requests/2"][0]["body"])
+
+    async def test_review_retries_only_the_failed_batch_with_the_backup_model(self):
+        files = self.commit_retry_review_files()
+        self.use_review_fallback(window=1800)
+        attempts = []
+
+        async def generate(*, chat_provider_id, system_prompt, prompt, **kwargs):
+            request = json.loads(prompt)
+            path = next(
+                path for path in files if f"+++ b/{path}" in request["task"]["diff"]
+            )
+            output = current_model_output_limit.get()
+            attempts.append((chat_provider_id, path, system_prompt, prompt, output))
+            if chat_provider_id == "test-model" and path == "b_changes.py":
+                raise TimeoutError("Injected model timeout")
+            evidence = next(
+                ref for ref, row in request["evidence"].items() if path in row["label"]
+            )
+            return SimpleNamespace(
+                completion_text=json.dumps(
+                    {"findings": [{"text": f"检查 {path[0]}", "refs": [evidence]}]}
+                )
+            )
+
+        self.adapter.context.llm_generate = generate
+        response = await self.deliver_native(self.review_command(101))
+        self.assertEqual(
+            (response.status_code, response.json()), (200, {"accepted": True})
+        )
+        await self.wait_done()
+
+        self.assertEqual(
+            [(provider, path) for provider, path, *_ in attempts],
+            [
+                ("test-model", "a_changes.py"),
+                ("test-model", "b_changes.py"),
+                ("test-model", "b_changes.py"),
+                ("test-model", "c_changes.py"),
+                ("backup-model", "b_changes.py"),
+            ],
+        )
+        _, _, system, prompt, output = attempts[-1]
+        self.assertEqual(output, 450)
+        self.assertLessEqual(
+            EstimateTokenCounter().count_tokens(
+                [
+                    Message(role="system", content=system),
+                    Message(role="user", content=prompt),
+                ]
+            )
+            + output,
+            1800,
+        )
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 1)
+        body = notes[0]["body"]
+        for path in list(files)[:3]:
+            self.assertIn(f"检查 {path[0]}", body)
+            self.assertIn(f"/-/blob/{self.head}/{path}#L", body)
+        self.assertIn("预算遗漏的文件**\n\n- `d_changes.py`", body)
+        self.assertNotIn("失败批次", body)
+
+    def commit_retry_review_files(self):
+        files = {
+            f"{letter}_changes.py": f"def change_{letter}():\n    return {letter!r}\n"
+            + "".join(f"# {letter} event {i:02d}: {letter * 43}\n" for i in range(40))
+            for letter in "abcd"
+        }
+        self.commit_review_files(files)
+        self.provider.provider_config["max_context_tokens"] = 2000
+        self.adapter.config["enable_large_pr_chunking"] = True
+        return files
+
+    def use_review_fallback(self, *, window):
+        backup = SimpleNamespace(provider_config={"max_context_tokens": window})
+        self.adapter.context.get_provider_by_id = {
+            "test-model": self.provider,
+            "backup-model": backup,
+        }.get
+        self.adapter.config["gitlab_review_fallback_provider"] = "backup-model"
+
+    async def test_review_preserves_summary_when_the_middle_batch_fails_validation(
+        self,
+    ):
+        files = self.commit_retry_review_files()
+        self.adapter.config["final_update_message"] = False
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+        notes = self.notes["/merge_requests/2"]
+        original = notes[0].copy()
+
+        self.use_review_fallback(window=1800)
+        attempts = []
+        fail_middle = True
+        invalidate_base = False
+
+        async def generate(*, chat_provider_id, system_prompt, prompt, **kwargs):
+            request = json.loads(prompt)
+            path = next(
+                path for path in files if f"+++ b/{path}" in request["task"]["diff"]
+            )
+            attempts.append((chat_provider_id, path, system_prompt))
+            if chat_provider_id == "backup-model":
+                if invalidate_base:
+                    self.base = self.head
+                output = current_model_output_limit.get()
+                self.assertEqual(output, 450)
+                self.assertLessEqual(
+                    EstimateTokenCounter().count_tokens(
+                        [
+                            Message(role="system", content=system_prompt),
+                            Message(role="user", content=prompt),
+                        ]
+                    )
+                    + 450,
+                    1800,
+                )
+                return SimpleNamespace(
+                    completion_text='{"findings":' + "[" * 2500 + "]" * 2500 + "}"
+                )
+            evidence = next(
+                ref for ref, row in request["evidence"].items() if path in row["label"]
+            )
+            findings = [{"text": f"检查 {path[0]}", "refs": [evidence]}]
+            if fail_middle and path == "b_changes.py":
+                findings.append({"text": "结构无效的发现", "refs": evidence})
+            return SimpleNamespace(completion_text=json.dumps({"findings": findings}))
+
+        self.adapter.context.llm_generate = generate
+        event = self.review_command(102)
+        await self.deliver_native(event)
+        await self.wait_done()
+
+        self.assertEqual(notes[0], original)
+        self.assertEqual(len(notes), 2)
+        body = notes[1]["body"]
+        self.assertIn("部分评审", body)
+        self.assertIn("失败批次（已完成 2/3 批，失败 1 批）", body)
+        self.assertIn("第 2 批\n\n- `b_changes.py`", body)
+        self.assertIn("预算遗漏的文件**\n\n- `d_changes.py`", body)
+        self.assertNotIn("检查 b", body)
+        self.assertNotIn("结构无效的发现", body)
+        for path in ("a_changes.py", "c_changes.py"):
+            self.assertIn(f"检查 {path[0]}", body)
+            self.assertIn(f"/-/blob/{self.head}/{path}#L", body)
+        self.assertEqual(
+            [(provider, path) for provider, path, _ in attempts],
+            [
+                ("test-model", "a_changes.py"),
+                ("test-model", "b_changes.py"),
+                ("test-model", "b_changes.py"),
+                ("test-model", "c_changes.py"),
+                ("backup-model", "b_changes.py"),
+                ("backup-model", "b_changes.py"),
+            ],
+        )
+        for attempt in (attempts[2], attempts[5]):
+            self.assertIn("上次输出格式无效", attempt[2])
+
+        fail_middle = False
+        attempts.clear()
+        await self.deliver_native(event)
+        await self.wait_done()
+        self.assertEqual(attempts, [])
+        self.assertEqual(len(notes), 2)
+
+        await self.deliver_native(self.review_command(103))
+        await self.wait_done()
+        self.assertEqual([path for _, path, _ in attempts], list(files)[:3])
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0]["id"], original["id"])
+        self.assertIn("检查 b", notes[0]["body"])
+        self.assertNotIn("失败批次", notes[0]["body"])
+
+        current = notes[0].copy()
+        fail_middle = invalidate_base = True
+        await self.deliver_native(self.review_command(104))
+        await self.wait_done()
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0], current)
+
+    async def test_review_skips_a_backup_request_that_cannot_fit_its_context(self):
+        files = self.commit_retry_review_files()
+        self.use_review_fallback(window=1500)
+        attempts = []
+        middle_messages = []
+
+        async def generate(*, chat_provider_id, system_prompt, prompt, **kwargs):
+            request = json.loads(prompt)
+            path = next(
+                path for path in files if f"+++ b/{path}" in request["task"]["diff"]
+            )
+            attempts.append((chat_provider_id, path))
+            if path == "b_changes.py":
+                middle_messages.extend(
+                    [
+                        Message(role="system", content=system_prompt),
+                        Message(role="user", content=prompt),
+                    ]
+                )
+                return SimpleNamespace(
+                    completion_text='{"findings":[{"text":"输入被缩减后的发现","refs":[]}]}',
+                    usage_matches_request=False,
+                )
+            return SimpleNamespace(completion_text='{"findings":[]}')
+
+        self.adapter.context.llm_generate = generate
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertEqual(attempts, [("test-model", path) for path in list(files)[:3]])
+        tokens = EstimateTokenCounter().count_tokens(middle_messages)
+        self.assertLess(tokens, 1500)
+        self.assertGreater(tokens + 375, 1500)
+        notes = self.notes["/merge_requests/2"]
+        self.assertEqual(len(notes), 1)
+        body = notes[0]["body"]
+        self.assertIn("失败批次（已完成 2/3 批，失败 1 批）", body)
+        self.assertIn("第 2 批\n\n- `b_changes.py`", body)
+        self.assertNotIn("输入被缩减后的发现", body)
+
+    async def test_review_limits_failed_file_paths_across_batches(self):
+        files = {f"change_{i:02d}.txt": f"line {i}\n" for i in range(54)}
+        self.commit_review_files(files)
+        self.provider.provider_config["max_context_tokens"] = 1000
+        self.adapter.config.update(
+            enable_large_pr_chunking=True, max_number_of_calls=54
+        )
+        diffs = set()
+
+        async def invalid_output(*, prompt, **kwargs):
+            diffs.add(json.loads(prompt)["task"]["diff"])
+            return SimpleNamespace(completion_text='{"findings":null}')
+
+        self.adapter.context.llm_generate = invalid_output
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+
+        self.assertGreater(len(diffs), 1)
+        for path in files:
+            self.assertTrue(any(f"+++ b/{path}\n" in diff for diff in diffs), path)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertEqual(sum(f"`{path}`" in body for path in files), 50)
+        self.assertIn("另有 4 个文件", body)
+        self.assertIn(
+            f"失败批次（已完成 0/{len(diffs)} 批，失败 {len(diffs)} 批）", body
+        )
 
     async def test_chunked_review_reports_distinct_file_coverage(self):
         self.provider.provider_config["max_context_tokens"] = 1500
@@ -1369,12 +1621,19 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertNotIn("max_completion_tokens", requests[0])
 
     async def test_review_reports_failure_after_native_chat_discards_the_diff(self):
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+        notes = self.notes["/merge_requests/2"]
+        original = notes[0].copy()
+
         requests = await self.use_native_chat("Qwen/Qwen3-8B", reject_context=True)
-        await self.deliver(
-            self.event(
-                "merge_request", action="open", iid=2, last_commit={"id": self.head}
-            )
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
         )
+        self.lose_next_review_post_response = True
+        await self.deliver_native(event)
+        await self.wait_done()
+        await self.deliver_native(event)
         await self.wait_done()
 
         self.assertEqual(len(requests), 2)
@@ -1383,8 +1642,12 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             json.loads(requests[0]["messages"][-1]["content"])["task"]["diff"],
         )
         self.assertEqual([m["role"] for m in requests[1]["messages"]], ["system"])
-        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertEqual(notes[0], original)
+        self.assertEqual(len(notes), 2)
+        body = notes[1]["body"]
         self.assertIn("评审失败", body)
+        self.assertIn("失败批次（已完成 0/1 批，失败 1 批）", body)
+        self.assertIn("第 1 批\n\n- `service.py`", body)
         self.assertNotIn("模型返回的发现", body)
 
     async def test_issue_analysis_keeps_the_provider_recovery_behavior(self):

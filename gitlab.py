@@ -192,13 +192,25 @@ class GitLab:
         return ""
 
     async def marker_note(self, path, marker, bot_id):
+        return (await self.marker_notes(path, (marker,), bot_id)).get(marker)
+
+    async def marker_notes(
+        self, path, markers: tuple[str, ...], bot_id
+    ) -> dict[str, dict]:
+        """Find the first bot-authored note for each marker in one paginated scan."""
+        remaining = set(markers)
+        matches = {}
         async for notes in self._pages(f"{path}/notes"):
             for note in notes:
-                if (note.get("author") or {}).get("id") == bot_id and marker in (
-                    note.get("body") or ""
-                ).splitlines():
-                    return note
-        return None
+                if (note.get("author") or {}).get("id") != bot_id:
+                    continue
+                found = remaining.intersection((note.get("body") or "").splitlines())
+                for marker in found:
+                    matches[marker] = note
+                remaining.difference_update(found)
+                if not remaining:
+                    return matches
+        return matches
 
     async def publish_review(self, path, body, existing, *, as_thread):
         if existing:

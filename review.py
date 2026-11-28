@@ -115,6 +115,12 @@ class PreparedBatch:
     coverage: dict[str, bool]
 
 
+@dataclass(frozen=True)
+class ReviewReport:
+    body: str
+    has_failed_batches: bool
+
+
 @dataclass
 class PreparedReview:
     batches: list[PreparedBatch]
@@ -122,20 +128,48 @@ class PreparedReview:
     filtered: list[str]
     deleted: list[str]
 
-    def summary(self, results: list[dict], version: ReviewVersion, web_url: str) -> str:
-        lines = merge_findings(self.batches, results)
-        if not lines:
-            lines.append(
+    def summary(
+        self, results: list[dict | None], version: ReviewVersion, web_url: str
+    ) -> ReviewReport:
+        failed = []
+        clipped = []
+        for number, (batch, result) in enumerate(
+            zip(self.batches, results, strict=True), start=1
+        ):
+            if result is None:
+                failed.append((number, list(batch.coverage)))
+            else:
+                clipped.extend(
+                    path for path, complete in batch.coverage.items() if not complete
+                )
+
+        completed = len(self.batches) - len(failed)
+        if not self.batches:
+            lines = ["本次没有提交给模型评审的文件补丁。"]
+        elif not completed:
+            lines = ["评审失败。本次没有确认任何文件的评审覆盖。"]
+        else:
+            lines = merge_findings(self.batches, results) or [
                 "在本次评审覆盖的差异中未发现可确认的问题。"
-                if self.batches
-                else "本次没有提交给模型评审的文件补丁。"
+            ]
+            if failed:
+                lines.insert(0, "部分评审结果。")
+        if failed:
+            lines.append(
+                f"**失败批次（已完成 {completed}/{len(self.batches)} 批，失败 {len(failed)} 批）**"
             )
-        clipped = [
-            path
-            for batch in self.batches
-            for path, complete in batch.coverage.items()
-            if not complete
-        ]
+            remaining = COVERAGE_PATH_LIMIT
+            for number, paths in failed:
+                if not remaining:
+                    break
+                shown = paths[:remaining]
+                lines.extend([f"第 {number} 批", format_coverage_paths(shown)])
+                remaining -= len(shown)
+            hidden = sum(len(paths) for _, paths in failed) - (
+                COVERAGE_PATH_LIMIT - remaining
+            )
+            if hidden:
+                lines.append(f"另有 {hidden} 个文件评审失败，路径未展示。")
         for label, paths in (
             ("部分评审的文件", clipped),
             ("预算遗漏的文件", self.omitted),
@@ -148,22 +182,22 @@ class PreparedReview:
             f"分析版本 [{version.head[:10]}](<{web_url}/-/tree/{version.head}>)"
             f"，比较基线 `{version.base}`。"
         )
-        return "\n\n".join(lines)
+        return ReviewReport("\n\n".join(lines), has_failed_batches=bool(failed))
 
 
-def merge_findings(batches: list[PreparedBatch], results: list[dict]) -> list[str]:
+def merge_findings(
+    batches: list[PreparedBatch], results: list[dict | None]
+) -> list[str]:
     merged: list[tuple[str, dict[str, dict]]] = []
     for batch, result in zip(batches, results, strict=True):
+        if result is None:
+            continue
         for finding in result["findings"]:
-            if not isinstance(finding, dict) or not finding.get("text"):
-                continue
-            message = " ".join(str(finding["text"]).split())
-            refs = finding.get("refs")
+            message = " ".join(finding["text"].split())
             rows = {}
-            if isinstance(refs, list):
-                for ref in refs[:5]:
-                    if row := batch.evidence.get(str(ref)):
-                        rows[row["url"]] = row
+            for ref in finding["refs"][:5]:
+                if row := batch.evidence.get(ref):
+                    rows[row["url"]] = row
             # IDs are scoped to the request. Only resolved links establish that
             # two grounded findings with the same wording share a location.
             matches = [
@@ -567,4 +601,12 @@ def decode_review(text: str) -> dict:
     findings = result.get("findings")
     if not isinstance(findings, list):
         raise ValueError("Expected a list of review findings")
+    for finding in findings:
+        if not isinstance(finding, dict):
+            raise ValueError("Expected a review finding object")
+        message, refs = finding.get("text"), finding.get("refs")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Expected non-empty review finding text")
+        if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+            raise ValueError("Expected a list of review evidence IDs")
     return result

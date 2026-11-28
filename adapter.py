@@ -23,9 +23,12 @@ from .gitlab import APIError, GitLab
 from .review import (
     REVIEW_REPORT,
     REVIEW_RETRY,
+    PreparedBatch,
     ReviewBudget,
+    ReviewReport,
     ReviewVersion,
     decode_review,
+    estimate_tokens,
     prepare_review,
 )
 from .review_files import GENERATED_FRAMEWORK_GLOBS
@@ -37,6 +40,7 @@ DEFAULTS = dict(
     gitlab_token="",
     gitlab_webhook_secret="",
     gitlab_provider="",
+    gitlab_review_fallback_provider="",
     gitlab_auto_issue=True,
     gitlab_auto_review=True,
     ignore_language_framework=[],
@@ -69,6 +73,11 @@ FIELDS = {
     "gitlab_provider": {
         "type": "string",
         "description": "项目分析模型",
+        "_special": "select_provider",
+    },
+    "gitlab_review_fallback_provider": {
+        "type": "string",
+        "description": "MR 评审后备模型（可选）",
         "_special": "select_provider",
     },
     "gitlab_auto_issue": {"type": "bool", "description": "Issue 自动回复"},
@@ -193,10 +202,12 @@ class GitLabPlatform(Platform):
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
 
-    async def request_completion(self, system, prompt, *, output_limit=None, **kwargs):
+    async def request_completion(
+        self, system, prompt, *, provider_id=None, output_limit=None, **kwargs
+    ):
         with model_delivery(None, output_limit=output_limit):
             return await self.context.llm_generate(
-                chat_provider_id=self.config["gitlab_provider"],
+                chat_provider_id=provider_id or self.config["gitlab_provider"],
                 system_prompt=system,
                 prompt=prompt,
                 **kwargs,
@@ -282,8 +293,39 @@ class GitLabPlatform(Platform):
                         "UPDATE jobs SET state='done',payload=NULL WHERE id=?", (key,)
                     )
 
-    async def review_mr(self, path, version, job, item, discussion):
-        provider = self.context.get_provider_by_id(self.config["gitlab_provider"])
+    async def review_batch(
+        self, batch: PreparedBatch, provider_id: str, budget: ReviewBudget
+    ) -> dict | None:
+        system = REVIEW_REPORT
+        for _ in range(2):
+            try:
+                reply = await self.request_completion(
+                    system,
+                    batch.prompt,
+                    provider_id=provider_id,
+                    output_limit=budget.output,
+                    llm_params=budget.llm_params,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "GitLab review model request failed (%s)", type(exc).__name__
+                )
+                continue
+            if getattr(reply, "usage_matches_request", True) is False:
+                # The provider already retried with less input. Its answer
+                # cannot establish coverage for the planned batch.
+                return None
+            try:
+                return decode_review(reply.completion_text)
+            except (TypeError, ValueError, RecursionError):
+                system = REVIEW_RETRY
+        return None
+
+    async def review_mr(
+        self, path, version, job, item, discussion
+    ) -> ReviewReport | None:
+        provider_id = self.config["gitlab_provider"]
+        provider = self.context.get_provider_by_id(provider_id)
         budget = ReviewBudget.for_provider(provider)
         max_batches = 1
         chunking = bool(self.config.get("enable_large_pr_chunking"))
@@ -308,23 +350,23 @@ class GitLabPlatform(Platform):
         if ReviewVersion.from_mr(await self.api.get(path)) != version:
             return None
 
-        results = []
-        for batch in prepared.batches:
-            for system in (REVIEW_REPORT, REVIEW_RETRY):
-                reply = await self.request_completion(
-                    system,
-                    batch.prompt,
-                    output_limit=budget.output,
-                    llm_params=budget.llm_params,
-                )
-                if getattr(reply, "usage_matches_request", True) is False:
-                    return "评审失败。模型提供商重试时缩减了原始输入，本次没有确认任何文件的评审覆盖。"
-                try:
-                    results.append(decode_review(reply.completion_text))
-                    break
-                except (TypeError, ValueError):
-                    if system == REVIEW_RETRY:
-                        raise
+        results = [
+            await self.review_batch(batch, provider_id, budget)
+            for batch in prepared.batches
+        ]
+        fallback_id = self.config.get("gitlab_review_fallback_provider")
+        if fallback_id and fallback_id != provider_id and None in results:
+            fallback = self.context.get_provider_by_id(fallback_id)
+            if fallback is not None:
+                fallback_budget = ReviewBudget.for_provider(fallback)
+                for index, batch in enumerate(prepared.batches):
+                    if (
+                        results[index] is None
+                        and estimate_tokens(batch.prompt) <= fallback_budget.input_limit
+                    ):
+                        results[index] = await self.review_batch(
+                            batch, fallback_id, fallback_budget
+                        )
         return prepared.summary(results, version, self.api.web)
 
     def note_marker(self, identifier):
@@ -413,17 +455,23 @@ class GitLabPlatform(Platform):
             return
         reviewing = is_mr and job["command"] == "review"
         marker = self.note_marker("review-summary" if reviewing else job["key"])
-        current = await self.api.marker_note(path, marker, bot_id)
         delivery_marker = self.note_marker(f"review-run:{delivery}")
         updated_marker = "<!-- review-summary-updated -->"
-        if current and not reviewing:
-            return
-        if current and delivery_marker in current["body"]:
-            # Recover a save whose response was lost before we recorded it locally.
-            if updated_marker in current["body"]:
-                await self.finish_review_update(
-                    path, job, delivery, current["id"], bot_id
-                )
+        current = None
+        if reviewing:
+            notes = await self.api.marker_notes(path, (marker, delivery_marker), bot_id)
+            current = notes.get(marker)
+            if delivered := notes.get(delivery_marker):
+                # Recover a save whose response was lost before we recorded it locally.
+                if (
+                    current is delivered
+                    and updated_marker in delivered["body"].splitlines()
+                ):
+                    await self.finish_review_update(
+                        path, job, delivery, delivered["id"], bot_id
+                    )
+                return
+        elif await self.api.marker_note(path, marker, bot_id):
             return
         diff_version = ReviewVersion.from_mr(item) if reviewing else None
         if reviewing and not diff_version:
@@ -434,6 +482,7 @@ class GitLabPlatform(Platform):
             else f"<!-- head:{item.get('sha', '')} -->"
         )
         thread = await self.trigger_discussion(path, job, optional=reviewing)
+        report = None
         if not thread and not reviewing and job["key"].startswith("note:"):
             return
         if job["command"] == "help":
@@ -468,9 +517,10 @@ class GitLabPlatform(Platform):
                     raise
                 discussion = ""
             if diff_version:
-                body = await self.review_mr(path, diff_version, job, item, discussion)
-                if body is None:
+                report = await self.review_mr(path, diff_version, job, item, discussion)
+                if report is None:
                     return
+                body = report.body
             else:
                 diff = ""
                 if is_mr:
@@ -493,27 +543,31 @@ class GitLabPlatform(Platform):
                     or latest.get("work_in_progress")
                 ):
                     return
-        body = f"{body}\n\n{marker}\n{version}"
-        if reviewing:
-            body += f"\n{delivery_marker}"
-            if current:
-                body += f"\n{updated_marker}"
+        if report is not None:
+            summary = current if not report.has_failed_batches else None
+            markers = [version, delivery_marker]
+            if not report.has_failed_batches:
+                markers.insert(0, marker)
+            if summary:
+                markers.append(updated_marker)
+            body += "\n\n" + "\n".join(markers)
             try:
                 await self.api.publish_review(
                     path,
                     body,
-                    current,
-                    as_thread=self.config.get("publish_review_as_thread", False),
+                    summary,
+                    as_thread=not report.has_failed_batches
+                    and self.config.get("publish_review_as_thread", False),
                 )
             except (APIError, aiohttp.ClientError, TimeoutError):
                 if not await self.api.marker_note(path, delivery_marker, bot_id):
                     raise
-            if current:
+            if summary:
                 await self.finish_review_update(
-                    path, job, delivery, current["id"], bot_id, thread=thread
+                    path, job, delivery, summary["id"], bot_id, thread=thread
                 )
         else:
-            await self.api.publish(path, thread, body)
+            await self.api.publish(path, thread, f"{body}\n\n{marker}\n{version}")
 
     async def send_by_session(self, session, message_chain):
         """Deliver text to a session in the bound issue or MR.
