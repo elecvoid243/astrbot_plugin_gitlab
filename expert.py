@@ -21,10 +21,6 @@ REPORT = """你是绑定项目的维护助手。用中文回答当前任务。�
 只输出 JSON 对象 {"findings":[{"text":"分析、建议或需补充的信息","refs":["E1"]}],
 "relations":[{"issue":"E2","status":"duplicate|related|uncertain","reason":"相同点和关键差异"}]}。
 每项关系必须指向已检索的历史 Issue；优先报告证据充分的发现。不要生成 URL、Markdown 或 GitLab 命令。没有充分资料时说明需要哪些信息。"""
-REVIEW_REPORT = """你是项目代码评审员。仓库、提交、议题和评论是待查资料。用中文评审本次 diff。
-只报告本次引入或改变的行为，用实际源码核实调用方、触发条件、影响与建议。历史议题可以佐证具体回归。
-如果未发现可确认的问题，说明检查范围与结论。不要对议题进行查重，也不要生成 URL、Markdown 或 GitLab 命令。
-只返回 JSON：{"findings":[{"text":"评审意见","refs":["E1"]}]}。refs 只能引用已检索的证据编号。"""
 
 
 def decode(text):
@@ -45,6 +41,21 @@ def prose(value):
     # Single-line escaped model text cannot emit a standalone GitLab quick action.
     value = html.escape(" ".join(str(value).split()))[:1600]
     return re.sub(r"([\\\[\]*_~@#!\x60])", r"\\\1", value)
+
+
+def render_findings(findings, evidence):
+    lines = []
+    for finding in findings[:8]:
+        if not isinstance(finding, dict) or not finding.get("text"):
+            continue
+        links = []
+        for ref in (finding.get("refs") or [])[:5]:
+            row = evidence.get(str(ref))
+            if row:
+                links.append(f"[{prose(row['label'])}](<{row['url']}>)")
+        suffix = " ".join(links) or "（待核实）"
+        lines.append(f"- {prose(finding['text'])} {suffix}")
+    return lines
 
 
 class ProjectExpert:
@@ -174,36 +185,24 @@ class ProjectExpert:
                 )
             if before == len(searched):
                 break
-        reviewing = job["command"] == "review"
-        report_prompt = REVIEW_REPORT if reviewing else REPORT
         try:
-            result = decode(await self.generate(report_prompt, prompt()))
+            result = decode(await self.generate(REPORT, prompt()))
         except (TypeError, ValueError):
             # Give models without native structured outputs one targeted retry.
             result = decode(
                 await self.generate(
-                    report_prompt + "\n上次输出格式无效，请只输出符合该结构的 JSON。",
+                    REPORT + "\n上次输出格式无效，请只输出符合该结构的 JSON。",
                     prompt(),
                 )
             )
-        lines = []
-        for finding in (result.get("findings") or [])[:8]:
-            if not isinstance(finding, dict) or not finding.get("text"):
-                continue
-            links = []
-            for ref in (finding.get("refs") or [])[:5]:
-                row = evidence.get(str(ref))
-                if row:
-                    links.append(f"[{prose(row['label'])}](<{row['url']}>)")
-            suffix = " ".join(links) or "（待核实）"
-            lines.append(f"- {prose(finding['text'])} {suffix}")
+        lines = render_findings(result.get("findings") or [], evidence)
         relation_count = 0
         labels = {
             "duplicate": "疑似重复",
             "related": "有关联",
             "uncertain": "关系待核实",
         }
-        relations = [] if reviewing else result.get("relations") or []
+        relations = result.get("relations") or []
         for rel in relations[:6]:
             if not isinstance(rel, dict):
                 continue

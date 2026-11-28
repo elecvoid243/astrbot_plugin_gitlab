@@ -5,9 +5,41 @@ import os
 import re
 import sqlite3
 import subprocess
+from collections.abc import Callable, Iterator
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryFile
 from urllib.parse import quote
+
+
+@dataclass(frozen=True)
+class FilePatch:
+    path: str
+    status: str
+    text: str | None
+
+
+def patch_sections(
+    readline: Callable[[int], bytes], max_bytes: int
+) -> Iterator[str | None]:
+    section = bytearray()
+    oversized = False
+    line_start = True
+    for part in iter(lambda: readline(64 * 1024), b""):
+        if line_start and part.startswith(b"diff --git ") and (section or oversized):
+            yield None if oversized else section.decode("utf-8", "replace")
+            section.clear()
+            oversized = False
+        if not oversized:
+            if len(section) + len(part) > max_bytes:
+                section.clear()
+                oversized = True
+            else:
+                section.extend(part)
+        line_start = part.endswith(b"\n")
+    if section or oversized:
+        yield None if oversized else section.decode("utf-8", "replace")
 
 
 class SourceIndex:
@@ -283,3 +315,56 @@ class SourceIndex:
             if proc.wait(timeout=30):
                 raise RuntimeError("Git diff failed")
             return raw.decode("utf-8", "replace")
+
+    def review_patches(
+        self, base: str, head: str, max_patch_bytes: int
+    ) -> Iterator[FilePatch]:
+        """Yield pinned per-file patches, preserving paths too large to buffer."""
+        options = (
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--no-relative",
+            "--find-renames",
+            "--submodule=short",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+        )
+        paths = iter(
+            self.git(*options, "--name-status", "-z", base, head, "--").split(b"\0")[
+                :-1
+            ]
+        )
+        changes = []
+        for status, path in zip(paths, paths):
+            if status.startswith((b"R", b"C")):
+                path = next(paths)
+            changes.append(
+                (path.decode("utf-8", "replace"), status[:1].decode("ascii"))
+            )
+        with TemporaryFile() as output:
+            proc = subprocess.run(
+                ["git", "-C", str(self.repo), *options, "--patch", base, head, "--"],
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                timeout=180,
+                check=False,
+            )
+            if proc.returncode:
+                raise RuntimeError(f"Git diff failed with status {proc.returncode}")
+            output.seek(0)
+            sections = patch_sections(output.readline, max_patch_bytes)
+            for path, status in changes:
+                text = next(sections)
+                if status == "T":
+                    # Git renders a type change as a deletion and an addition.
+                    after = next(sections)
+                    text = (
+                        text + after if text is not None and after is not None else None
+                    )
+                yield FilePatch(path, status, text)
+            if next(sections, "") != "":
+                raise RuntimeError("Git produced more patches than file changes")

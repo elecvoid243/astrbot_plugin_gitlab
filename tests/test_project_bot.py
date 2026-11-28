@@ -7,10 +7,19 @@ import subprocess
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import httpx
 from aiohttp import web
+from astrbot.core.agent.context.token_counter import EstimateTokenCounter
+from astrbot.core.agent.message import Message
+from astrbot.core.agent_team_execution import current_model_output_limit
+from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
+from astrbot.dashboard.api.platform import router
+from astrbot.dashboard.services.platform_service import PlatformService
+from fastapi import FastAPI
 
 from ..adapter import DEFAULTS, GitLabPlatform, StarTools
 from ..events import project_job
@@ -42,7 +51,10 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.notes = {}
         self.calls = []
         self.reports = []
+        self.model_requests = []
         self.change_during_review = False
+        self.advance_head_on_discussion = False
+        self.base_after_review = None
         self.draft = False
         app = web.Application()
         app.router.add_route("*", "/api/v4/{path:.*}", self.route)
@@ -79,7 +91,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         )
         data.start()
         self.addCleanup(data.stop)
-        self.config = dict(
+        self.config: dict[str, Any] = dict(
             DEFAULTS,
             id="gitlab-demo",
             gitlab_url=self.origin,
@@ -88,12 +100,26 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             gitlab_webhook_secret="test-hook",
             gitlab_provider="test-model",
         )
-        ctx = SimpleNamespace(llm_generate=self.generate)
+        self.provider = SimpleNamespace(provider_config={"max_context_tokens": 24000})
+        ctx = SimpleNamespace(
+            llm_generate=self.generate,
+            get_provider_by_id=lambda _: self.provider,
+        )
         GitLabPlugin(ctx)
         self.adapter = GitLabPlatform(self.config, {}, asyncio.Queue())
         self.runner = asyncio.create_task(self.adapter.run())
         self.addAsyncCleanup(self.adapter.terminate)
         await self.wait(lambda: self.adapter.bot)
+        app = FastAPI()
+        app.include_router(router, prefix="/api/v1")
+        core = SimpleNamespace(
+            platform_manager=SimpleNamespace(platform_insts=[self.adapter])
+        )
+        app.state.services = SimpleNamespace(platforms=PlatformService(core))
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        )
+        self.addAsyncCleanup(self.client.aclose)
 
     def git(self, *args):
         return (
@@ -194,6 +220,13 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         if path.endswith("/discussions"):
             return web.json_response([dict(id="abc", notes=[dict(id=101)])])
         if path.endswith("/discussions/abc"):
+            if self.advance_head_on_discussion:
+                self.advance_head_on_discussion = False
+                self.git(
+                    "commit", "--allow-empty", "-m", "Push during review collection"
+                )
+                self.head = self.git("rev-parse", "HEAD")
+                self.git("update-ref", "refs/merge-requests/2/head", self.head)
             return web.json_response(
                 dict(
                     notes=[
@@ -220,6 +253,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
     async def generate(self, **kwargs):
         self.assertEqual(kwargs["chat_provider_id"], "test-model")
         prompt = json.loads(kwargs["prompt"])
+        self.model_requests.append(kwargs)
         if "requests" in kwargs["system_prompt"]:
             result = {
                 "requests": [
@@ -232,33 +266,54 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             self.reports.append(prompt)
             index = prompt["evidence"]
             src = [k for k, r in index.items() if "caller.py" in r["label"]]
-            issue = next(k for k, r in index.items() if r["label"] == "#8")
             self.assertFalse(any(r["label"] == "#9" for r in index.values()))
             result = dict(
-                findings=[dict(text="检查调用方是否对空值调用 upper", refs=src)],
-                relations=[
+                findings=[dict(text="检查调用方是否对空值调用 upper", refs=src)]
+            )
+            if prompt["task"]["command"] != "review":
+                issue = next(k for k, r in index.items() if r["label"] == "#8")
+                result["relations"] = [
                     dict(
                         issue=issue,
                         status="duplicate"
-                        if prompt["task"]["command"] in ("diagnose", "review")
+                        if prompt["task"]["command"] == "diagnose"
                         else "related",
                         reason="同一超时条件",
                     )
-                ],
-            )
+                ]
             if self.change_during_review:
                 self.head = "d" * 40
+            if self.base_after_review:
+                self.base = self.base_after_review
+            if prompt["task"]["command"] == "review":
+                output_limit = current_model_output_limit.get()
+                assert output_limit is not None
+                self.assertGreater(output_limit, 0)
+                if isinstance(self.provider, ProviderAnthropic):
+                    self.assertEqual(
+                        kwargs.get("llm_params"), {"max_tokens": output_limit}
+                    )
+                tokens = EstimateTokenCounter().count_tokens(
+                    [
+                        Message(role="system", content=kwargs["system_prompt"]),
+                        Message(role="user", content=kwargs["prompt"]),
+                    ]
+                )
+                self.assertLessEqual(
+                    tokens + output_limit,
+                    self.provider.provider_config["max_context_tokens"],
+                )
         return SimpleNamespace(completion_text=json.dumps(result))
 
     async def deliver(self, payload, secret="test-hook"):
-        async def get_json(**kwargs):
-            return payload
-
-        return await self.adapter.webhook_callback(
-            SimpleNamespace(headers={"X-Gitlab-Token": secret}, get_json=get_json)
+        response = await self.client.post(
+            "/api/v1/webhooks/platforms/" + self.config["webhook_uuid"],
+            json=payload,
+            headers={"X-Gitlab-Token": secret},
         )
+        return response.json(), response.status_code
 
-    def event(self, kind, **attrs):
+    def event(self, kind, **attrs) -> dict[str, Any]:
         return dict(
             object_kind=kind, project={"id": 8}, user={"id": 3}, object_attributes=attrs
         )
@@ -327,6 +382,180 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         await self.wait_done()
         self.assertFalse(self.notes.get("/merge_requests/2"))
 
+    async def test_review_includes_all_patches_past_old_limit_in_one_request(self):
+        (self.work / "a_feature.txt").write_text(
+            "".join(f"account event {i:03} ready for processing\n" for i in range(260))
+        )
+        (self.work / "z_feature.py").write_text("last_change = True\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "Add two features")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.reports), 1)
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("+account event 259 ready for processing", diff)
+        self.assertIn("+    return None", diff)
+        self.assertIn("+last_change = True", diff)
+        self.assertEqual(len(self.model_requests), 1)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn(f"/-/blob/{self.head}/caller.py", body)
+        self.assertNotIn("预算遗漏", body)
+
+    async def test_manual_review_drops_result_when_head_changes_during_collection(self):
+        event = self.event(
+            "note",
+            noteable_type="MergeRequest",
+            action="create",
+            id=101,
+            note="/review",
+        )
+        event["merge_request"] = {"iid": 2}
+        self.advance_head_on_discussion = True
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertFalse(self.model_requests)
+        self.assertFalse(self.notes.get("/merge_requests/2"))
+
+    async def test_review_prefers_complete_patches_to_extra_source_excerpts(self):
+        self.provider.provider_config["max_context_tokens"] = 1800
+        for filename, repeated in (("a_more.txt", "a"), ("z_more.txt", "b")):
+            (self.work / filename).write_text(
+                "".join(f"row {i:02d}: {repeated * 40}\n" for i in range(25))
+            )
+        self.git("add", ".")
+        self.git("commit", "-m", "Add two different data files")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        await self.deliver(event)
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("+row 24: " + "a" * 40, diff)
+        self.assertIn("+row 24: " + "b" * 40, diff)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn(f"/-/blob/{self.head}/caller.py", body)
+        self.assertNotIn("预算遗漏", body)
+
+    async def test_review_keeps_both_halves_of_a_git_file_type_change(self):
+        target = self.work / "target.txt"
+        target.write_text("caller.py")
+        blob = self.git("hash-object", "-w", "target.txt")
+        self.git("update-index", "--cacheinfo", f"120000,{blob},service.py")
+        self.git("commit", "-m", "Replace the service with a symbolic link")
+        self.base = self.head
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        await self.deliver(event)
+        await self.wait_done()
+
+        self.assertEqual(len(self.reports), 1)
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("-def find_order(key):", diff)
+        self.assertIn("+caller.py", diff)
+
+    async def test_review_reserves_the_effective_anthropic_output_limit(self):
+        self.provider = Mock(
+            spec=ProviderAnthropic,
+            provider_config={
+                "max_context_tokens": 5000,
+                "custom_extra_body": {"max_output_tokens": 1800},
+            },
+        )
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        await self.deliver(event)
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        self.assertEqual(self.model_requests[0]["llm_params"], {"max_tokens": 1800})
+        self.assertIn("/-/blob/", self.notes["/merge_requests/2"][0]["body"])
+
+    async def test_manual_draft_review_omits_whole_files_to_fit_the_selected_model(
+        self,
+    ):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        self.config["gitlab_auto_review"] = False
+        self.draft = True
+        (self.work / "a  large.txt").write_text(
+            "".join(f"account event {i:03} ready for processing\n" for i in range(110))
+        )
+        (self.work / "b_huge.txt").write_text(("a" * 70000) + "\n")
+        (self.work / "z_feature.py").write_text("last_change = True\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "Add large and small features")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "note",
+            noteable_type="MergeRequest",
+            action="create",
+            id=101,
+            note="/review",
+        )
+        event["merge_request"] = {"iid": 2}
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        task = self.reports[0]["task"]
+        self.assertEqual((task["base"], task["commit"]), (self.base, self.head))
+        self.assertNotIn("a  large.txt", task["diff"])
+        self.assertIn("+last_change = True", task["diff"])
+        self.assertIn("+    return None", task["diff"])
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn(f"/-/blob/{self.head}/caller.py", body)
+        self.assertIn("预算遗漏的文件**\n\n- `a  large.txt`\n- `b_huge.txt`", body)
+        self.assertNotIn("z_feature.py", body)
+
+    async def test_review_keeps_existing_summary_when_only_base_changes_before_publish(
+        self,
+    ):
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+        await self.deliver(event)
+        await self.wait_done()
+        notes = self.notes["/merge_requests/2"]
+        original = notes[0]["body"]
+        original_base = self.base
+        previous_head = self.head
+        self.git("commit", "--allow-empty", "-m", "Push a new MR head")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        self.base_after_review = previous_head
+        event["object_attributes"].update(
+            action="update", oldrev=previous_head, last_commit={"id": self.head}
+        )
+
+        await self.deliver(event)
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertEqual(self.reports[-1]["task"]["base"], original_base)
+        self.assertEqual(notes[0]["body"], original)
+        self.assertNotIn(("PUT", "/projects/8/merge_requests/2/notes/1"), self.calls)
+
     async def test_thread_and_filters(self):
         event = self.event(
             "note",
@@ -370,11 +599,7 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         )
 
     async def test_native_webhook_and_panel_registration(self):
-        import httpx
-        from fastapi import FastAPI
         from astrbot.core.platform.register import platform_registry
-        from astrbot.dashboard.api.platform import router
-        from astrbot.dashboard.services.platform_service import PlatformService
 
         registered = next(
             platform for platform in platform_registry if platform.name == "gitlab"
@@ -383,25 +608,12 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             registered.config_metadata["gitlab_provider"]["_special"], "select_provider"
         )
         self.assertTrue(registered.default_config_tmpl["gitlab_auto_review"])
-        app = FastAPI()
-        app.include_router(router, prefix="/api/v1")
-        core = SimpleNamespace(
-            platform_manager=SimpleNamespace(platform_insts=[self.adapter])
-        )
-        app.state.services = SimpleNamespace(platforms=PlatformService(core))
         event = self.event(
             "note", noteable_type="Issue", action="create", id=101, note="/help"
         )
         event["issue"] = {"iid": 1}
-        path = "/api/v1/webhooks/platforms/" + self.config["webhook_uuid"]
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://test"
-        ) as client:
-            self.assertEqual((await client.post(path, json=event)).status_code, 403)
-            res = await client.post(
-                path, json=event, headers={"X-Gitlab-Token": "test-hook"}
-            )
-            self.assertEqual((res.status_code, res.json()), (200, {"accepted": True}))
+        self.assertEqual((await self.deliver(event, secret=""))[1], 403)
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
         await self.wait_done()
         self.assertIn(
             ("POST", "/projects/8/issues/1/discussions/abc/notes"), self.calls

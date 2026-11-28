@@ -14,13 +14,22 @@ import aiohttp
 from astrbot.api import logger
 from astrbot.api.message_components import Plain
 from astrbot.api.platform import Platform, PlatformMetadata, register_platform_adapter
-from astrbot.api.star import StarTools
+from astrbot.api.star import Context, StarTools
+from astrbot.core.agent_team_execution import model_delivery
+from astrbot.core.provider.sources.anthropic_source import ProviderAnthropic
 
 from .events import project_job
 from .expert import HELP, ProjectExpert
 from .gitlab import APIError, GitLab
+from .review import (
+    REVIEW_REPORT,
+    REVIEW_RETRY,
+    ReviewBudget,
+    ReviewVersion,
+    decode_review,
+    prepare_review,
+)
 from .source import SourceIndex
-
 
 DEFAULTS = dict(
     gitlab_url="",
@@ -69,7 +78,7 @@ FIELDS = {
     support_streaming_message=False,
 )
 class GitLabPlatform(Platform):
-    context = None
+    context: Context
 
     def __init__(self, platform_config, platform_settings, event_queue):
         super().__init__(platform_config, event_queue)
@@ -151,12 +160,14 @@ class GitLabPlatform(Platform):
             self.worker.cancel()
             await asyncio.gather(self.worker, return_exceptions=True)
 
-    async def generate(self, system, prompt):
-        reply = await self.context.llm_generate(
-            chat_provider_id=self.config["gitlab_provider"],
-            system_prompt=system,
-            prompt=prompt,
-        )
+    async def generate(self, system, prompt, *, output_limit=None, **kwargs):
+        with model_delivery(None, output_limit=output_limit):
+            reply = await self.context.llm_generate(
+                chat_provider_id=self.config["gitlab_provider"],
+                system_prompt=system,
+                prompt=prompt,
+                **kwargs,
+            )
         return reply.completion_text
 
     async def webhook_callback(self, request):
@@ -235,6 +246,37 @@ class GitLabPlatform(Platform):
                         "UPDATE jobs SET state='done',payload=NULL WHERE id=?", (key,)
                     )
 
+    async def review_mr(self, path, version, job, item, discussion):
+        provider = self.context.get_provider_by_id(self.config["gitlab_provider"])
+        budget = ReviewBudget.for_provider(provider)
+        prepared = await asyncio.to_thread(
+            prepare_review, self.source, version, budget, job, item, discussion
+        )
+        if ReviewVersion.from_mr(await self.api.get(path)) != version:
+            return None
+
+        result = {"findings": []}
+        if prepared.prompt:
+            llm_params = (
+                {"max_tokens": budget.output}
+                if isinstance(provider, ProviderAnthropic)
+                else None
+            )
+            for system in (REVIEW_REPORT, REVIEW_RETRY):
+                completion = await self.generate(
+                    system,
+                    prepared.prompt,
+                    output_limit=budget.output,
+                    llm_params=llm_params,
+                )
+                try:
+                    result = decode_review(completion)
+                    break
+                except (TypeError, ValueError):
+                    if system == REVIEW_RETRY:
+                        raise
+        return prepared.summary(result, version, self.api.web)
+
     async def process(self, job):
         """Resolve membership and pinned source before publishing one result.
 
@@ -261,7 +303,16 @@ class GitLabPlatform(Platform):
         ).hexdigest()[:24]
         marker = f"<!-- astrbot-gitlab:{digest} -->"
         current = await self.api.marker_note(path, marker, self.bot["id"])
-        version = f"<!-- head:{item.get('sha', '')} -->"
+        diff_version = (
+            ReviewVersion.from_mr(item) if job["command"] == "review" else None
+        )
+        if job["command"] == "review" and not diff_version:
+            raise ValueError("MR diff version is not ready")
+        version = (
+            diff_version.marker
+            if diff_version
+            else f"<!-- head:{item.get('sha', '')} -->"
+        )
         if current and (not automatic or version in current["body"]):
             return
         if job["key"].startswith("note:") and not job["thread"]:
@@ -304,18 +355,23 @@ class GitLabPlatform(Platform):
                 raise
             if is_mr and sha != item["sha"]:
                 raise ValueError("MR head changed during fetch")
-            diff = ""
-            if is_mr:
-                refs = item.get("diff_refs") or {}
-                if refs.get("head_sha") != sha or not re.fullmatch(
-                    r"[a-f0-9]{40,64}", refs.get("base_sha") or ""
-                ):
-                    raise ValueError("MR diff version is not ready")
-                diff = await asyncio.to_thread(self.source.diff, refs["base_sha"])
             thread = await self.api.discussion(path, job["thread"])
-            body = await self.expert.analyze(job, item, diff, thread)
+            if diff_version:
+                body = await self.review_mr(path, diff_version, job, item, thread)
+                if body is None:
+                    return
+            else:
+                diff = ""
+                if is_mr:
+                    refs = ReviewVersion.from_mr(item)
+                    if not refs:
+                        raise ValueError("MR diff version is not ready")
+                    diff = await asyncio.to_thread(self.source.diff, refs.base)
+                body = await self.expert.analyze(job, item, diff, thread)
             if is_mr:
                 latest = await self.api.get(path)
+                if diff_version and ReviewVersion.from_mr(latest) != diff_version:
+                    return
                 if latest["sha"] != sha:
                     if automatic:
                         return
