@@ -544,10 +544,19 @@ class GitLabPlatform(Platform):
                 ):
                     return
         if report is not None:
-            summary = current if not report.has_failed_batches else None
+            # Findings in existing canonical summaries precede the coverage footer.
+            preserve_findings = (
+                report.has_incomplete_file_coverage
+                and current is not None
+                and current["body"].lstrip().startswith("- ")
+            )
+            supplemental = report.has_failed_batches or preserve_findings
+            summary = None if supplemental else current
             markers = [version, delivery_marker]
-            if not report.has_failed_batches:
+            if not supplemental:
                 markers.insert(0, marker)
+            elif preserve_findings and not report.has_failed_batches:
+                body = "部分评审结果。已保留原评审摘要。\n\n" + body
             if summary:
                 markers.append(updated_marker)
             body += "\n\n" + "\n".join(markers)
@@ -556,7 +565,7 @@ class GitLabPlatform(Platform):
                     path,
                     body,
                     summary,
-                    as_thread=not report.has_failed_batches
+                    as_thread=not supplemental
                     and self.config.get("publish_review_as_thread", False),
                 )
             except (APIError, aiohttp.ClientError, TimeoutError):

@@ -119,6 +119,7 @@ class PreparedBatch:
 class ReviewReport:
     body: str
     has_failed_batches: bool
+    has_incomplete_file_coverage: bool
 
 
 @dataclass
@@ -182,7 +183,11 @@ class PreparedReview:
             f"分析版本 [{version.head[:10]}](<{web_url}/-/tree/{version.head}>)"
             f"，比较基线 `{version.base}`。"
         )
-        return ReviewReport("\n\n".join(lines), has_failed_batches=bool(failed))
+        return ReviewReport(
+            "\n\n".join(lines),
+            has_failed_batches=bool(failed),
+            has_incomplete_file_coverage=bool(clipped or self.omitted or self.deleted),
+        )
 
 
 def merge_findings(

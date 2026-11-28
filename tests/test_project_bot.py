@@ -53,6 +53,8 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.git("update-ref", "refs/merge-requests/2/head", self.head)
         self.notes = {}
         self.review_threads = {}
+        self.discussion_notes_separate = False
+        self.trigger_review_replies = []
         self.reject_review_reply = False
         self.reject_review_discussion_lookup = False
         self.review_notes_second_page = False
@@ -242,9 +244,14 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             thread = dict(id="summary-thread", individual_note=False, notes=[note])
             self.review_threads[thread["id"]] = thread
             notes.append(note)
+            if self.lose_next_review_post_response:
+                self.lose_next_review_post_response = False
+                raise web.HTTPBadGateway()
             return web.json_response(thread, status=201)
         if path.endswith("/discussions"):
-            groups = [dict(id="abc", notes=[dict(id=101)])]
+            groups = [
+                dict(id="abc", notes=[dict(id=101), *self.trigger_review_replies])
+            ]
             if path == "/merge_requests/2/discussions":
                 if self.reject_review_discussion_lookup:
                     raise web.HTTPForbidden()
@@ -276,6 +283,10 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             scope = "/".join(path.split("/")[:3])
             notes = self.notes.setdefault(scope, [])
             if req.method == "GET":
+                if self.discussion_notes_separate and path == "/merge_requests/2/notes":
+                    notes = [
+                        note for note in notes if note.get("type") != "DiscussionNote"
+                    ]
                 if self.review_notes_second_page and path == "/merge_requests/2/notes":
                     page = req.query.get("page", "1")
                     if page == "1":
@@ -290,6 +301,12 @@ class TestProjectBot(IsolatedAsyncioTestCase):
                     self.reject_next_review_notice = False
                     raise web.HTTPBadGateway()
                 note = dict(id=len(notes) + 1, author={"id": 77}, body=payload["body"])
+                if (
+                    self.discussion_notes_separate
+                    and path == "/merge_requests/2/discussions/abc/notes"
+                ):
+                    note["type"] = "DiscussionNote"
+                    self.trigger_review_replies.append(note)
                 notes.append(note)
                 if self.lose_next_review_post_response and scope == "/merge_requests/2":
                     self.lose_next_review_post_response = False
@@ -297,6 +314,12 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             elif req.method == "PUT":
                 note_id = int(path.split("/")[-1])
                 note = next(note for note in notes if note["id"] == note_id)
+                if (
+                    self.discussion_notes_separate
+                    and note.get("type") == "DiscussionNote"
+                    and "/discussions/" not in path
+                ):
+                    raise web.HTTPNotFound()
                 note["body"] = payload["body"]
                 if self.lose_review_update_response and scope == "/merge_requests/2":
                     self.lose_review_update_response = False
@@ -573,6 +596,44 @@ class TestProjectBot(IsolatedAsyncioTestCase):
             f"{self.origin}/team/demo/-/merge_requests/2#note_{summary['id']}",
             self.notes["/merge_requests/2"][1]["body"],
         )
+
+    async def test_review_recovers_notes_visible_only_through_discussions(self):
+        self.discussion_notes_separate = True
+        self.adapter.config.update(
+            publish_review_as_thread=True, reply_to_trigger_comment=True
+        )
+        self.lose_next_review_post_response = True
+        await self.deliver_native(self.review_command(101, discussion_id="abc"))
+        await self.wait_done()
+
+        summary = self.review_threads["summary-thread"]["notes"][0]
+        original_body = summary["body"]
+        self.adapter.config["publish_review_as_thread"] = False
+        self.lose_next_review_post_response = True
+        await self.deliver_native(self.review_command(102, discussion_id="abc"))
+        await self.wait_done()
+
+        self.assertEqual(len(self.reports), 2)
+        self.assertNotEqual(summary["body"], original_body)
+        self.assertEqual(
+            self.calls.count(("POST", "/projects/8/merge_requests/2/discussions")),
+            1,
+        )
+        update = self.calls.index(
+            (
+                "PUT",
+                f"/projects/8/merge_requests/2/discussions/summary-thread/notes/{summary['id']}",
+            )
+        )
+        self.assertEqual(
+            self.calls[update - 1], ("GET", "/projects/8/merge_requests/2")
+        )
+        self.assertEqual(len(self.trigger_review_replies), 1)
+        self.assertIn(
+            f"{self.origin}/team/demo/-/merge_requests/2#note_{summary['id']}",
+            self.trigger_review_replies[0]["body"],
+        )
+        self.assertNotIn(("POST", "/projects/8/merge_requests/2/notes"), self.calls)
 
     async def test_update_link_goes_to_the_trigger_discussion(self):
         await self.deliver_native(self.review_command(100))
@@ -997,8 +1058,56 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.head = self.git("rev-parse", "HEAD")
         self.git("update-ref", "refs/merge-requests/2/head", self.head)
 
+    async def test_budget_limited_review_preserves_findings_in_the_existing_summary(
+        self,
+    ):
+        self.commit_review_files(
+            {
+                f"{letter}_events.txt": "".join(
+                    f"{letter} event {index:02d}: {letter * 40}\n"
+                    for index in range(34)
+                )
+                for letter in "ab"
+            }
+        )
+        self.adapter.config["final_update_message"] = False
+
+        def findings_in_b(request):
+            return [
+                {"text": "核对 b_events 中的事件定义", "refs": [key]}
+                for key, evidence in request["evidence"].items()
+                if "b_events.txt" in evidence["label"]
+            ]
+
+        self.review_findings = findings_in_b
+        await self.deliver_native(self.review_command(101))
+        await self.wait_done()
+        notes = self.notes["/merge_requests/2"]
+        original = notes[0].copy()
+        self.assertIn("核对 b\\_events 中的事件定义", original["body"])
+        self.assertIn(f"/-/blob/{self.head}/b_events.txt#L", original["body"])
+
+        self.provider.provider_config["max_context_tokens"] = 1500
+        await self.deliver_native(self.review_command(102))
+        await self.wait_done()
+
+        self.assertEqual(notes[0], original)
+        self.assertEqual(len(notes), 2)
+        self.assertIn("已保留原评审摘要", notes[1]["body"])
+        self.assertIn("预算遗漏的文件**\n\n- `b_events.txt`", notes[1]["body"])
+
+        self.provider.provider_config["max_context_tokens"] = 24000
+        self.review_findings = lambda _: []
+        await self.deliver_native(self.review_command(103))
+        await self.wait_done()
+
+        self.assertEqual(len(notes), 2)
+        self.assertEqual(notes[0]["id"], original["id"])
+        self.assertNotIn("核对 b\\_events", notes[0]["body"])
+
     async def test_review_chunking_is_opt_in_and_respects_the_project_batch_limit(self):
         self.provider.provider_config["max_context_tokens"] = 1500
+        self.review_findings = lambda _: []
         files = {
             f"{letter}_events.txt": "".join(
                 f"{letter} event {i:02d}: {letter * 40}\n" for i in range(34)
@@ -1213,9 +1322,10 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertEqual(attempts, [])
         self.assertEqual(len(notes), 2)
 
+        self.adapter.config["max_number_of_calls"] = 4
         await self.deliver_native(self.review_command(103))
         await self.wait_done()
-        self.assertEqual([path for _, path, _ in attempts], list(files)[:3])
+        self.assertEqual([path for _, path, _ in attempts], list(files))
         self.assertEqual(len(notes), 2)
         self.assertEqual(notes[0]["id"], original["id"])
         self.assertIn("检查 b", notes[0]["body"])
@@ -1354,7 +1464,9 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertIn("+# event 0000: " + "x" * 40 + "\n", diff)
         self.assertNotIn("+# event 0999", diff)
         self.assertNotIn("wide_line.txt", diff)
-        body = self.notes["/merge_requests/2"][0]["body"]
+        notes = self.notes["/merge_requests/2"]
+        original = notes[0].copy()
+        body = original["body"]
         self.assertIn("部分评审的文件**\n\n- `service.py`", body)
         self.assertIn(f"/-/blob/{self.head}/caller.py#L", body)
         self.assertIn("预算遗漏的文件**\n\n- `wide_line.txt`", body)
@@ -1365,7 +1477,10 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         await self.wait_done()
 
         self.assertFalse(self.model_requests)
-        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertEqual(notes[0], original)
+        self.assertEqual(len(notes), 2)
+        body = notes[1]["body"]
+        self.assertIn("已保留原评审摘要", body)
         self.assertNotIn("部分评审的文件", body)
         self.assertIn("预算遗漏的文件**\n\n- `service.py`\n- `wide_line.txt`", body)
 

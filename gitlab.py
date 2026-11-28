@@ -197,25 +197,48 @@ class GitLab:
     async def marker_notes(
         self, path, markers: tuple[str, ...], bot_id
     ) -> dict[str, dict]:
-        """Find the first bot-authored note for each marker in one paginated scan."""
+        """Find bot-authored markers, checking MR discussions on a Notes miss."""
         remaining = set(markers)
         matches = {}
+
+        def capture(note, discussion_id=None):
+            if (note.get("author") or {}).get("id") != bot_id:
+                return
+            found = remaining.intersection((note.get("body") or "").splitlines())
+            if not found:
+                return
+            if discussion_id:
+                note = {**note, "discussion_id": discussion_id}
+            matches.update(dict.fromkeys(found, note))
+            remaining.difference_update(found)
+
         async for notes in self._pages(f"{path}/notes"):
             for note in notes:
-                if (note.get("author") or {}).get("id") != bot_id:
-                    continue
-                found = remaining.intersection((note.get("body") or "").splitlines())
-                for marker in found:
-                    matches[marker] = note
-                remaining.difference_update(found)
+                capture(note)
                 if not remaining:
                     return matches
+
+        # An ordinary summary and its standalone failed reports are all in Notes.
+        if matches or not path.startswith("/merge_requests/"):
+            return matches
+        try:
+            async for discussions in self._pages(f"{path}/discussions"):
+                for discussion in discussions:
+                    discussion_id = discussion.get("id")
+                    for note in discussion.get("notes", ()):
+                        capture(note, discussion_id)
+                        if not remaining:
+                            return matches
+        except APIError as exc:
+            if exc.status not in (401, 403, 404, 405):
+                raise
         return matches
 
     async def publish_review(self, path, body, existing, *, as_thread):
         if existing:
             note_id = int(existing["id"])
-            # Updating by note ID also keeps a discussion note in its original thread.
+            if discussion_id := existing.get("discussion_id"):
+                path += f"/discussions/{quote(discussion_id, safe='')}"
             await self.request(
                 "PUT", f"{self.root}{path}/notes/{note_id}", body={"body": body}
             )
