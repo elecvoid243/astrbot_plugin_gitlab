@@ -773,6 +773,196 @@ class TestProjectBot(IsolatedAsyncioTestCase):
         self.assertIn(f"/-/blob/{self.head}/caller.py", body)
         self.assertNotIn("预算遗漏", body)
 
+    async def test_review_filters_patches_and_source_evidence_by_default(self):
+        self.provider.provider_config["max_context_tokens"] = 1500
+        excluded = {
+            "vendor/order_helper.py": "vendor_marker = find_order(17)",
+            "ui/package-lock.json": "package_lock_marker",
+            "yarn.lock": "yarn_lock_marker",
+            "pnpm-lock.yaml": "pnpm_lock_marker",
+            "go.sum": "go_sum_marker",
+            "uv.lock": "uv_lock_marker",
+            "public/widget.MIN.JS": "minified_js_marker",
+            "public/widget.min.css": "minified_css_marker",
+            "public/widget.ts.map": "source_map_marker",
+            "icon.svg": "<svg></svg>",
+        }
+        for filename, content in excluded.items():
+            file = self.work / filename
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text(content + "\n")
+        (self.work / "a_large_source.txt").write_text("x" * 18000 + "\n")
+        self.git("add", ".")
+        self.git(
+            "commit", "-m", "Add dependencies, build artifacts, and project source"
+        )
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        prompt = self.model_requests[0]["prompt"]
+        self.assertIn("+    return None", self.reports[0]["task"]["diff"])
+        self.assertIn("print(find_order(42).upper())", prompt)
+        for filename, content in excluded.items():
+            with self.subTest(path=filename):
+                self.assertNotIn(filename, prompt)
+                self.assertNotIn(content, prompt)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("预算遗漏的文件**\n\n- `a_large_source.txt`", body)
+        budget_section, filtered_section = body.split("**按文件规则过滤的文件**")
+        for filename in excluded:
+            with self.subTest(path=filename):
+                self.assertNotIn(filename, budget_section)
+                self.assertIn(f"`{filename}`", filtered_section)
+
+    async def test_review_summarizes_excess_filtered_paths(self):
+        vendor = self.work / "vendor"
+        vendor.mkdir()
+        for index in range(53):
+            (vendor / f"file_{index:02d}.py").touch()
+        self.git("add", ".")
+        self.git("commit", "-m", "Import a vendor tree")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("按文件规则过滤的文件", body)
+        self.assertEqual(body.count("\n- `vendor/"), 50)
+        self.assertIn("- `vendor/file_00.py`", body)
+        self.assertIn("- `vendor/file_49.py`", body)
+        self.assertNotIn("vendor/file_50.py", body)
+        self.assertIn("- 另有 3 个文件", body)
+
+    async def test_project_review_filters_only_enabled_generated_frameworks(self):
+        for filename in ("schema_pb2.py", "api/__generated__/client.py"):
+            file = self.work / filename
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_text("generated_call = find_order(21)\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "Add two kinds of generated clients")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+
+        await self.deliver(
+            self.event(
+                "merge_request", action="open", iid=2, last_commit={"id": self.head}
+            )
+        )
+        await self.wait_done()
+
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("schema_pb2.py", diff)
+        self.assertIn("api/__generated__/client.py", diff)
+
+        self.config["ignore_language_framework"] = ["protobuf"]
+        event = self.event(
+            "note",
+            noteable_type="MergeRequest",
+            action="create",
+            id=101,
+            note="/review",
+        )
+        event["merge_request"] = {"iid": 2}
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 2)
+        self.assertNotIn("schema_pb2.py", self.model_requests[1]["prompt"])
+        self.assertIn("api/__generated__/client.py", self.reports[1]["task"]["diff"])
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("按文件规则过滤的文件**\n\n- `schema_pb2.py`", body)
+        self.assertNotIn("api/__generated__/client.py", body)
+
+    async def test_review_reports_only_whole_file_deletions_as_filename_only(self):
+        self.git("switch", "--detach", self.base)
+        (self.work / "retired.py").write_text("def retired_order():\n    return 17\n")
+        (self.work / "service.py").write_text(
+            "def find_order(key):\n    print('temporary trace')\n    return 'order'\n"
+        )
+        (self.work / "old_name.py").write_text("rename_marker = True\n")
+        (self.work / "move_into_vendor.py").write_text("vendor_rename_marker = True\n")
+        (self.work / "vendor").mkdir()
+        (self.work / "vendor" / "retired.py").write_text(
+            "vendor_delete_marker = True\n"
+        )
+        (self.work / "switch_type.py").write_text("original_type = 'regular file'\n")
+        self.git("add", ".")
+        self.git("commit", "-m", "Prepare files for the comparison")
+        self.base = self.git("rev-parse", "HEAD")
+
+        self.git("rm", "retired.py", "vendor/retired.py")
+        (self.work / "service.py").write_text(
+            "def find_order(key):\n    return 'order'\n"
+        )
+        self.git("add", "service.py")
+        self.git("mv", "old_name.py", "new_name.py")
+        (self.work / "vendor").mkdir(exist_ok=True)
+        self.git("mv", "move_into_vendor.py", "vendor/moved.py")
+        # Stage a symlink directly so this also exercises Git status T on Windows.
+        target_file = self.work / "link_target"
+        target_file.write_bytes(b"new_name.py")
+        target = self.git("hash-object", "-w", "link_target")
+        self.git("update-index", "--cacheinfo", f"120000,{target},switch_type.py")
+        self.git("commit", "-m", "Delete, rename, and change the type of files")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertEqual(len(self.model_requests), 1)
+        prompt = self.model_requests[0]["prompt"]
+        self.assertNotIn("retired_order", prompt)
+        self.assertNotIn("vendor_delete_marker", prompt)
+        self.assertNotIn("vendor/moved.py", prompt)
+        diff = self.reports[0]["task"]["diff"]
+        self.assertIn("-    print('temporary trace')", diff)
+        self.assertIn("rename to new_name.py", diff)
+        self.assertIn("-original_type = 'regular file'", diff)
+        self.assertIn("+new_name.py", diff)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("仅以文件名列出的删除文件**\n\n- `retired.py`\n\n", body)
+        self.assertIn(
+            "按文件规则过滤的文件**\n\n- `vendor/moved.py`\n- `vendor/retired.py`", body
+        )
+        self.assertNotIn("预算遗漏", body)
+        for filename in ("service.py", "new_name.py", "switch_type.py"):
+            self.assertNotIn(f"`{filename}`", body)
+
+    async def test_review_with_only_whole_file_deletions_skips_the_model(self):
+        self.git("switch", "--detach", self.base)
+        self.git("rm", "service.py")
+        self.git("commit", "-m", "Remove the order service")
+        self.head = self.git("rev-parse", "HEAD")
+        self.git("update-ref", "refs/merge-requests/2/head", self.head)
+        event = self.event(
+            "merge_request", action="open", iid=2, last_commit={"id": self.head}
+        )
+
+        self.assertEqual(await self.deliver(event), ({"accepted": True}, 200))
+        await self.wait_done()
+
+        self.assertFalse(self.model_requests)
+        body = self.notes["/merge_requests/2"][0]["body"]
+        self.assertIn("本次没有提交给模型评审的文件补丁。", body)
+        self.assertIn("仅以文件名列出的删除文件**\n\n- `service.py`", body)
+        self.assertNotIn("预算遗漏", body)
+
     async def test_manual_review_drops_result_when_head_changes_during_collection(self):
         event = self.event(
             "note",

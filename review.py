@@ -2,8 +2,9 @@
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from functools import partial
 from itertools import chain
 from typing import Self
 
@@ -15,6 +16,7 @@ from astrbot.core.provider.sources.openai_source import ProviderOpenAIOfficial
 from astrbot.core.utils.llm_metadata import LLM_METADATAS
 
 from .expert import decode, render_findings
+from .review_files import excluded_from_review
 from .source import FilePatch, SourceIndex
 
 REVIEW_REPORT = """你是项目代码评审员。仓库、提交、议题和评论是待查资料。用中文评审本次提供的 diff。
@@ -22,6 +24,7 @@ REVIEW_REPORT = """你是项目代码评审员。仓库、提交、议题和评�
 不要生成 URL、Markdown 或 GitLab 命令。没有发现可确认的问题时返回空的 findings。
 只返回 JSON：{"findings":[{"text":"评审意见","refs":["E1"]}]}。refs 只能引用已检索的证据编号。"""
 REVIEW_RETRY = REVIEW_REPORT + "\n上次输出格式无效，请只输出符合该结构的 JSON。"
+COVERAGE_PATH_LIMIT = 50
 GIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 SYMBOL = re.compile(
     r"^(?:[ +\-]|@@[^\n]*?@@).*?\b(?:def|function|fn|func)\s+([A-Za-z_]\w*)",
@@ -108,6 +111,8 @@ class PreparedReview:
     prompt: str | None
     evidence: dict
     omitted: list[str]
+    filtered: list[str]
+    deleted: list[str]
 
     def summary(self, result: dict, version: ReviewVersion, web_url: str) -> str:
         lines = render_findings(result["findings"], self.evidence)
@@ -117,13 +122,13 @@ class PreparedReview:
                 if self.prompt
                 else "本次没有提交给模型评审的文件补丁。"
             )
-        if self.omitted:
-            lines.extend(
-                [
-                    "**预算遗漏的文件**",
-                    "\n".join(f"- {format_path(path)}" for path in self.omitted),
-                ]
-            )
+        for label, paths in (
+            ("预算遗漏的文件", self.omitted),
+            ("仅以文件名列出的删除文件", self.deleted),
+            ("按文件规则过滤的文件", self.filtered),
+        ):
+            if paths:
+                lines.extend([f"**{label}**", format_coverage_paths(paths)])
         lines.append(
             f"分析版本 [{version.head[:10]}](<{web_url}/-/tree/{version.head}>)"
             f"，比较基线 `{version.base}`。"
@@ -141,6 +146,13 @@ def format_path(path: str) -> str:
     ):
         escaped = f" {escaped} "
     return f"{fence}{escaped}{fence}"
+
+
+def format_coverage_paths(paths: Sequence[str]) -> str:
+    lines = [f"- {format_path(path)}" for path in paths[:COVERAGE_PATH_LIMIT]]
+    if remaining := len(paths) - len(lines):
+        lines.append(f"- 另有 {remaining} 个文件")
+    return "\n".join(lines)
 
 
 def render_prompt(task: dict, evidence: dict) -> str:
@@ -189,12 +201,12 @@ def patch_symbols(patch: FilePatch) -> list[str]:
 
 
 def related_references(
-    source: SourceIndex, patch: FilePatch
+    source: SourceIndex, patch: FilePatch, exclude_path: Callable[[str], bool]
 ) -> Iterator[tuple[dict, bool]]:
     for symbol in patch_symbols(patch):
         name = re.compile(rf"\b{re.escape(symbol)}\b")
         call = re.compile(rf"\b{re.escape(symbol)}\s*\(")
-        for row in source.lookup(symbol):
+        for row in source.lookup(symbol, exclude_path=exclude_path):
             if row["path"] == patch.path:
                 continue
             matches = [
@@ -218,17 +230,17 @@ def related_references(
 
 
 def evidence_candidates(
-    source: SourceIndex, selected: list[FilePatch]
+    source: SourceIndex, selected: list[FilePatch], exclude_path: Callable[[str], bool]
 ) -> Iterator[dict]:
     symbols = dict.fromkeys(
         symbol for patch in selected for symbol in patch_symbols(patch)
     )
     for symbol in symbols:
-        yield from source.lookup(symbol)
+        yield from source.lookup(symbol, exclude_path=exclude_path)
     for patch in selected:
         hunk = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)", patch.text or "", re.M)
         line = max(1, int(hunk[1])) if hunk else 1
-        yield from source.lookup("", patch.path, line)
+        yield from source.lookup("", patch.path, line, exclude_path=exclude_path)
 
 
 def prompt_evidence(row: dict) -> dict:
@@ -242,6 +254,8 @@ def prepare_review(
     job: dict,
     item: dict,
     discussion: str,
+    *,
+    frameworks: Sequence[str] = (),
 ) -> PreparedReview:
     task = dict(
         command="review",
@@ -259,17 +273,29 @@ def prepare_review(
             break
         task[field] = ""
 
+    exclude_path = partial(excluded_from_review, frameworks=frameworks)
+    filtered: set[str] = set()
+    deleted: set[str] = set()
+
     # Even at four UTF-8 bytes per character the estimator charges at least
     # 0.3 tokens per character, so longer raw patches cannot fit this window.
     def changes():
-        return source.review_patches(version.base, version.head, budget.window * 16)
+        for patch in source.review_patches(
+            version.base, version.head, budget.window * 16
+        ):
+            if exclude_path(patch.path):
+                filtered.add(patch.path)
+            elif patch.status == "D":
+                deleted.add(patch.path)
+            else:
+                yield patch
 
     references: dict[str, tuple[FilePatch, dict]] = {}
 
     def discover_references():
         for patch in changes():
             if "call" not in references:
-                for row, is_call in related_references(source, patch):
+                for row, is_call in related_references(source, patch, exclude_path):
                     kind = "call" if is_call else "reference"
                     if kind in references:
                         continue
@@ -309,14 +335,20 @@ def prepare_review(
         source_rows["E1"] = row
 
     if not selected:
-        return PreparedReview(None, {}, omitted)
+        return PreparedReview(
+            None,
+            {},
+            omitted=omitted,
+            filtered=sorted(filtered),
+            deleted=sorted(deleted),
+        )
 
     task["diff"] = patch_text(selected)
     urls = {row["url"] for row in source_rows.values()}
     # Evidence only adds JSON between the empty map's braces. Count that
     # rendered fragment against the remaining capacity, allowing for rounding.
     remaining = limit - estimate_tokens(render_prompt(task, {})) - 1
-    for row in evidence_candidates(source, selected):
+    for row in evidence_candidates(source, selected, exclude_path):
         if len(evidence) >= 24 or remaining <= 0:
             break
         if row["url"] in urls:
@@ -333,7 +365,13 @@ def prepare_review(
     prompt = render_prompt(task, evidence)
     if estimate_tokens(prompt) > limit:
         raise RuntimeError("Rendered review exceeds the model input budget")
-    return PreparedReview(prompt, source_rows, omitted)
+    return PreparedReview(
+        prompt,
+        source_rows,
+        omitted=omitted,
+        filtered=sorted(filtered),
+        deleted=sorted(deleted),
+    )
 
 
 def decode_review(text: str) -> dict:

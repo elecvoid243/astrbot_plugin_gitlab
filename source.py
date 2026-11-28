@@ -175,16 +175,26 @@ class SourceIndex:
                 db.execute("INSERT INTO version VALUES (?)", (sha,))
         self.sha = sha
 
-    def lookup(self, query, path="", line=1):
+    def lookup(
+        self,
+        query,
+        path="",
+        line=1,
+        *,
+        exclude_path: Callable[[str], bool] | None = None,
+    ):
         """Return source passages with immutable links to the observed lines.
 
         Args:
             query: Literal tokens to search for when no path is supplied.
             path: Exact repository-relative file to read.
             line: First requested line.
+            exclude_path: Filter paths before selecting the most relevant passages.
         Returns:
             Evidence records containing excerpts and GitLab blob links.
         """
+        if path and exclude_path and exclude_path(path):
+            return []
         with closing(sqlite3.connect(self.database)) as db:
             if path:
                 rows = db.execute(
@@ -196,14 +206,25 @@ class SourceIndex:
                 if not terms:
                     return []
                 expr = " OR ".join('"' + term + '"' for term in terms)
+                path_filter = ""
+                if exclude_path:
+                    db.create_function(
+                        "exclude_path", 1, exclude_path, deterministic=True
+                    )
+                    path_filter = " AND NOT exclude_path(path)"
                 rows = db.execute(
-                    "SELECT path,line,body FROM passages WHERE passages MATCH ? ORDER BY bm25(passages, 0.3, 1) LIMIT 6",
+                    "SELECT path,line,body FROM passages WHERE passages MATCH ?"
+                    + path_filter
+                    + " ORDER BY bm25(passages, 0.3, 1) LIMIT 6",
                     (expr,),
                 ).fetchall()
                 if not rows:
                     term = max(terms, key=len)
                     rows = db.execute(
-                        "SELECT path,line,body FROM passages WHERE instr(lower(body),lower(?)) OR instr(lower(path),lower(?)) LIMIT 6",
+                        "SELECT path,line,body FROM passages WHERE "
+                        "(instr(lower(body),lower(?)) OR instr(lower(path),lower(?)))"
+                        + path_filter
+                        + " LIMIT 6",
                         (term, term),
                     ).fetchall()
         result = []

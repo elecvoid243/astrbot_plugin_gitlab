@@ -28,6 +28,7 @@ from .review import (
     decode_review,
     prepare_review,
 )
+from .review_files import GENERATED_FRAMEWORK_GLOBS
 from .source import SourceIndex
 
 DEFAULTS = dict(
@@ -38,6 +39,7 @@ DEFAULTS = dict(
     gitlab_provider="",
     gitlab_auto_issue=True,
     gitlab_auto_review=True,
+    ignore_language_framework=[],
     publish_review_as_thread=False,
     final_update_message=True,
     reply_to_trigger_comment=False,
@@ -68,6 +70,11 @@ FIELDS = {
     },
     "gitlab_auto_issue": {"type": "bool", "description": "Issue 自动回复"},
     "gitlab_auto_review": {"type": "bool", "description": "MR 自动评审"},
+    "ignore_language_framework": {
+        "type": "list",
+        "description": "在 MR 评审中排除所选框架的生成文件",
+        "options": list(GENERATED_FRAMEWORK_GLOBS),
+    },
     "publish_review_as_thread": {
         "type": "bool",
         "description": "将新评审摘要发布为可解决讨论",
@@ -264,7 +271,14 @@ class GitLabPlatform(Platform):
         provider = self.context.get_provider_by_id(self.config["gitlab_provider"])
         budget = ReviewBudget.for_provider(provider)
         prepared = await asyncio.to_thread(
-            prepare_review, self.source, version, budget, job, item, discussion
+            prepare_review,
+            self.source,
+            version,
+            budget,
+            job,
+            item,
+            discussion,
+            frameworks=self.config.get("ignore_language_framework") or (),
         )
         if ReviewVersion.from_mr(await self.api.get(path)) != version:
             return None
